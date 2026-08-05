@@ -9,6 +9,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN
 
@@ -67,7 +68,9 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
 
-    dp = Dispatcher()
+    # ⚠️ CRITICAL FIX: Add MemoryStorage to enable FSM states
+    # Without this, BroadcastState and all FSM functionality will NOT work
+    dp = Dispatcher(storage=MemoryStorage())
 
     # ==========================
     # LOAD ROUTERS

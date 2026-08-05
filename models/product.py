@@ -39,6 +39,16 @@ class Product(Base):
 
     category: Mapped[Optional[str]] = mapped_column(String(255))
 
+    # Optional delivery instructions shown to buyer AFTER purchase.
+    # Appears as a clickable button in the purchase confirmation message
+    # and in the order detail view.
+    # NULL means no instructions for this product.
+    delivery_instruction: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+    )
+
     # DECIMAL(20, 8) — always compare/multiply as Decimal, never float.
     price: Mapped[Decimal] = mapped_column(
         Numeric(20, 8),

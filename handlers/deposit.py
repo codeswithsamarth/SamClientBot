@@ -430,7 +430,7 @@ async def _show_deposits_page(callback: CallbackQuery, page: int = 0):
 
     if total == 0:
         text = (
-            f"{_border_box('MY DEPOSITS', '📜')}\n\n"
+            f"📜 <b>MY DEPOSITS</b>\n\n"
             f"<b>No deposits found!</b>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"💡 You haven't made any deposits yet.\n"
@@ -459,7 +459,7 @@ async def _show_deposits_page(callback: CallbackQuery, page: int = 0):
         cards.append(_build_deposit_card(deposit, 0))
 
     text = (
-        f"{_border_box('MY DEPOSITS', '📜')}\n\n"
+        f"📜 <b>MY DEPOSITS</b>\n\n"
         f"<b>Showing {start_idx}-{end_idx} of {total} deposits</b>\n"
         f"{_divider('─', 28)}\n\n"
         + "\n".join(cards) +
@@ -621,7 +621,7 @@ async def deposit_menu(callback: CallbackQuery):
     await callback.answer()
 
     text = (
-        f"{_border_box('DEPOSIT FUNDS', '💰')}\n\n"
+        f"💰 <b>DEPOSIT FUNDS</b>\n\n"
         f"<b>Select your preferred payment method:</b>\n\n"
         f"{_divider('─', 28)}\n\n"
         f"🟡 <b>USDT (BEP20)</b>\n"
@@ -637,6 +637,7 @@ async def deposit_menu(callback: CallbackQuery):
         f"{_divider('─', 28)}\n\n"
         f"💡 <i>All deposits are verified automatically</i>"
     )
+
 
     await show(
         callback,
@@ -658,7 +659,7 @@ async def deposit_promo_start(callback: CallbackQuery, state: FSMContext):
     await show(
         callback,
         (
-            f"{_border_box('REDEEM PROMOCODE', '🏷️')}\n\n"
+            f"🏷️ <b>REDEEM PROMOCODE</b>\n\n"
             f"<b>Enter your promocode to get bonus credits!</b>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"💡 <b>How it works:</b>\n"
@@ -797,7 +798,7 @@ async def process_promo_code(message: Message, state: FSMContext):
         await update_card(
             message, None,
             (
-                f"{_border_box('PROMOCODE REDEEMED!', '🎉')}\n\n"
+                f"🎉 <b>PROMOCODE REDEEMED!</b>\n\n"
                 f"<b>Congratulations!</b> Your promo code has been applied.\n\n"
                 f"{_divider('═', 28)}\n\n"
                 f"🏷️ <b>Code:</b> <code>{result['code']}</code>\n"
@@ -817,7 +818,7 @@ async def process_promo_code(message: Message, state: FSMContext):
         await update_card(
             message, None,
             (
-                f"{_border_box('PROMOCODE REDEEMED!', '🎉')}\n\n"
+                f"🎉 <b>PROMOCODE REDEEMED!</b>\n\n"
                 f"<b>Congratulations!</b> Your promo code has been applied.\n\n"
                 f"{_divider('═', 28)}\n\n"
                 f"🏷️ <b>Code:</b> <code>{result['code']}</code>\n"
@@ -862,7 +863,7 @@ async def select_network(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositState.waiting_amount)
 
     text = (
-        f"{_border_box('ENTER AMOUNT', network_config['icon'])}\n\n"
+        f"{network_config['icon']} <b>ENTER AMOUNT</b>\n\n"
         f"<b>Method:</b> {network_config['icon']} {network_config['label']}\n"
         f"<b>Network:</b> {network_config['description']}\n"
         f"<b>Currency:</b> {network_config['currency']}\n\n"
@@ -1081,7 +1082,7 @@ async def process_amount(message: Message, state: FSMContext):
     await state.update_data(deposit_id=deposit_id)
 
     text = (
-        f"{_border_box('DEPOSIT CREATED', network_config['icon'])}\n\n"
+        f"{network_config['icon']} <b>DEPOSIT CREATED</b>\n\n"
         f"<b>📋 Deposit Details</b>\n"
         f"{_divider('─', 28)}\n\n"
         f"🆔 <b>Deposit ID:</b> <code>#{deposit_id}</code>\n"
@@ -1311,7 +1312,7 @@ async def process_txid(message: Message, state: FSMContext):
         await update_card(
             message, None,
             (
-                f"{_border_box('DEPOSIT CONFIRMED', '✅')}\n\n"
+                f"✅ <b>DEPOSIT CONFIRMED</b>\n\n"
                 f"🎉 <b>Your deposit has been confirmed!</b>\n\n"
                 f"{_divider('─', 28)}\n\n"
                 f"🆔 <b>Deposit:</b> <code>#{deposit_id}</code>\n"
@@ -1353,8 +1354,7 @@ async def process_txid(message: Message, state: FSMContext):
             await update_card(
                 message, None,
                 (
-                    f"{_border_box('AMOUNT MISMATCH', '⚠️')}\n\n"
-                    f"<b>You sent less than the required amount.</b>\n\n"
+                    f"⚠️ <b>AMOUNT MISMATCH</b>\n\n"                    f"<b>You sent less than the required amount.</b>\n\n"
                     f"{_divider('─', 28)}\n\n"
                     f"📋 <b>Required:</b> {result_info.get('requested')}\n"
                     f"📥 <b>Received:</b> {result_info.get('received')}\n"
@@ -1385,8 +1385,7 @@ async def process_txid(message: Message, state: FSMContext):
             await update_card(
                 message, None,
                 (
-                    f"{_border_box('VERIFICATION FAILED', '❌')}\n\n"
-                    f"<b>We couldn't verify your payment.</b>\n\n"
+                    f"❌ <b>VERIFICATION FAILED</b>\n\n"                    f"<b>We couldn't verify your payment.</b>\n\n"
                     f"{_divider('─', 28)}\n\n"
                     f"🆔 Deposit: <code>#{deposit_id}</code>\n"
                     f"🔑 Ref: <code>{txid[:24]}...</code>\n\n"
@@ -1410,7 +1409,7 @@ async def process_txid(message: Message, state: FSMContext):
 
     if network == "UPI":
         pending_msg = (
-            f"{_border_box('VERIFICATION PENDING', '⏳')}\n\n"
+            f"⏳ <b>VERIFICATION PENDING</b>\n\n"
             f"<b>Your payment is being verified.</b>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"🏦 <b>Method:</b> UPI Bank Transfer\n"
@@ -1424,7 +1423,7 @@ async def process_txid(message: Message, state: FSMContext):
         )
     elif network == BINANCE_PAY_NETWORK:
         pending_msg = (
-            f"{_border_box('VERIFICATION PENDING', '⏳')}\n\n"
+            f"⏳ <b>VERIFICATION PENDING</b>\n\n"
             f"<b>Your Binance Pay order is being verified.</b>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"🔴 <b>Method:</b> Binance Pay\n"
@@ -1437,7 +1436,7 @@ async def process_txid(message: Message, state: FSMContext):
         )
     else:
         pending_msg = (
-            f"{_border_box('VERIFICATION PENDING', '⏳')}\n\n"
+            f"⏳ <b>VERIFICATION PENDING</b>\n\n"
             f"<b>Your transaction is being verified.</b>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"📡 <b>Network:</b> {network_config['icon']} {network_config['label']}\n"

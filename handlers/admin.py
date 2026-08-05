@@ -1,4 +1,5 @@
-# handlers/admin.py — FIXED ADMIN PANEL WITH FULL DASHBOARD
+# handlers/admin.py — FIXED ADMIN PANEL WITH FULL DASHBOARD & BROADCAST
+import asyncio
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -26,7 +27,6 @@ from keyboards.admin_menu import get_admin_panel
 from keyboards.menu import get_admin_main_menu
 
 from states.broadcast import BroadcastState
-from utils.ui import show, update_card
 
 router = Router()
 
@@ -97,30 +97,28 @@ def _build_user_dashboard(user) -> str:
     first_name = user.full_name.split()[0] if user.full_name else "user"
 
     return (
-        "<code>$ connect Rain.network</code>\n"
-        "<code>Authenticating...</code>\n"
-        "<code>██████████████████ 100%</code>\n"
-        f"<code>[✓] Identity Verified : {safe(user.full_name)}</code>\n"
-        "<code>[✓] Commerce Services</code>\n"
-        "<code>[✓] Inventory Synced</code>\n"
-        "<code>[✓] Wallet Connected</code>\n"
-        "<code>[✓] Checkout Protected</code>\n"
-        "<code>[✓] Delivery Ready</code>\n"
-        "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-        "<b>▐▰▰ Rain STORE • Premium Digital Marketplace ▰▰▌</b>\n"
-        "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"<code>Session : {safe(first_name)}</code>\n"
-        "<code>Access  : Standard</code>\n"
-        "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-        "<code>■ Marketplace</code>\n"
-        f"<code>■ Wallet     </code> <code>${balance:.2f}</code>\n"
-        f"<code>■ Orders     </code> <code>{total_orders}</code>\n"
-        f"<code>■ Rewards    </code> <code>{total_refs} refs</code>\n"
-        "<code>■ Support</code>\n"
-        "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-        "<code>Ready for your next purchase.</code>\n"
-        f"<code>{safe(first_name.lower())}@Rain:~$</code>\n\n"
-        "👇 <b>Choose an option below to continue!</b> 👇"
+        "🛍 <b>Rain Store</b>\n"
+        "<i>Premium Digital Marketplace</i>\n\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"👋 Welcome back, <b>{safe(first_name)}</b>\n\n"
+        "<b>💎 Standard Plan</b>\n\n"
+        f"💰 Wallet: <b>${balance:.2f}</b>\n"
+        f"📦 Orders: <b>{total_orders}</b>\n"
+        f"🎁 Rewards: <b>{total_refs}</b>\n\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        "✓ Verified Premium Products\n"
+        "✓ Instant Delivery\n"
+        "✓ Secure Payments\n"
+        "✓ Dedicated Customer Support\n\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        "🛒 <b>Shop</b> <i>\"Browse premium digital products\"</i>\n"
+        "💰 <b>Deposit</b> <i>\"Top up your wallet instantly\"</i>\n"
+        "👤 <b>Profile</b> <i>\"Manage your account & wallet\"</i>\n"
+        "📦 <b>Orders</b> <i>\"View purchases & product keys\"</i>\n"
+        "📞 <b>Support</b> <i>\"Get help from our support team\"</i>\n\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        "📢 <b>Stay Updated:</b> @RainStore\n\n"
+        "👇 <b>Tap a button below to get started.</b>"
     )
 
 
@@ -332,33 +330,76 @@ async def admin_stats(callback: CallbackQuery):
 
 
 # =====================================================
-# BROADCAST
+# BROADCAST — FULLY FIXED
 # =====================================================
 
 @router.callback_query(F.data == "admin_broadcast")
 async def broadcast_start(callback: CallbackQuery, state: FSMContext):
+    """Start broadcast mode — sets FSM state and waits for message."""
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
         return
 
+    # Set state to wait for broadcast message
     await state.set_state(BroadcastState.waiting_message)
 
     await callback.message.edit_text(
-        "📢 <b>Broadcast Message</b>\n\nSend the message you want to broadcast to all users.",
+        "📢 <b>Broadcast Mode Activated</b>\n\n"
+        "✏️ Send me the message you want to broadcast to <b>ALL users</b>.\n\n"
+        "📝 <i>You can send text, photos, videos, documents — anything!</i>\n\n"
+        "⚠️ <i>This will be forwarded to every user in the database.</i>\n\n"
+        "👇 Click Cancel to abort.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="⬅ Cancel", callback_data="admin_panel")]
+                [InlineKeyboardButton(text="❌ Cancel Broadcast", callback_data="cancel_broadcast")]
             ]
         )
     )
 
-    await callback.answer()
+    await callback.answer("📢 Broadcast mode activated — send your message now.")
 
+
+@router.callback_query(F.data == "cancel_broadcast")
+async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Cancel the broadcast and return to admin panel."""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        await state.clear()
+
+    db = SessionLocal()
+    try:
+        text = _build_admin_dashboard(db, callback.from_user.full_name, callback.from_user.id)
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_admin_panel(),
+            parse_mode="HTML"
+        )
+    finally:
+        db.close()
+
+    await callback.answer("❌ Broadcast cancelled.")
+
+
+# HANDLERS/ADMIN.PY — REPLACE THE send_broadcast FUNCTION
 
 @router.message(BroadcastState.waiting_message)
 async def send_broadcast(message: Message, state: FSMContext):
+    """Handle the broadcast message and send to all users."""
     if message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        await message.answer("⛔ Access denied. You are not an admin.")
         return
+
+    # Send initial status message
+    status_msg = await message.answer(
+        "📢 <b>Broadcasting...</b>\n\n⏳ Fetching users from database...",
+        parse_mode="HTML"
+    )
 
     db = SessionLocal()
     try:
@@ -367,46 +408,130 @@ async def send_broadcast(message: Message, state: FSMContext):
     finally:
         db.close()
 
-    card = await update_card(
-        message,
-        state=state,
-        text="📢 Broadcasting..."
-    )
+    if not user_ids:
+        await status_msg.edit_text("⚠️ <b>No users found in database!</b>", parse_mode="HTML")
+        await state.clear()
+        return
 
-    chat_id = card.chat.id if card else message.chat.id
-    message_id = card.message_id if card else None
-
+    total = len(user_ids)
     sent = 0
     failed = 0
+    blocked = 0
+    deactivated = 0
+    not_started = 0
+    unknown_error = 0
+    error_details = []
 
-    for user_id in user_ids:
+    # Update status message
+    await status_msg.edit_text(
+        f"📢 <b>Broadcasting...</b>\n\n"
+        f"📊 Total users: {total}\n"
+        f"✅ Sent: 0\n"
+        f"❌ Failed: 0\n\n"
+        f"⏳ Starting broadcast...",
+        parse_mode="HTML"
+    )
+
+    # Send to each user with detailed error tracking
+    for i, user_id in enumerate(user_ids, 1):
         try:
             await message.copy_to(chat_id=user_id)
             sent += 1
-        except:
-            failed += 1
 
+            # Small delay to avoid hitting rate limits
+            if i % 5 == 0:
+                await asyncio.sleep(0.1)
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            if "bot was blocked by the user" in error_str or "blocked" in error_str:
+                blocked += 1
+            elif "user is deactivated" in error_str or "deactivated" in error_str:
+                deactivated += 1
+            elif "chat not found" in error_str:
+                not_started += 1
+            elif "bot can't initiate conversation" in error_str:
+                not_started += 1
+            else:
+                failed += 1
+                unknown_error += 1
+                # Store first few errors for debugging
+                if len(error_details) < 5:
+                    error_details.append(f"UID {user_id}: {str(e)[:100]}")
+
+        # Update progress every 5 users or on last user
+        if i % 5 == 0 or i == total:
+            try:
+                progress_text = (
+                    f"📢 <b>Broadcasting...</b>\n\n"
+                    f"📊 Progress: {i}/{total}\n"
+                    f"✅ Sent: {sent}\n"
+                    f"❌ Failed: {failed}\n"
+                    f"🚫 Blocked: {blocked}\n\n"
+                    f"⏳ Still sending..."
+                )
+                await status_msg.edit_text(progress_text, parse_mode="HTML")
+            except:
+                pass
+
+    # Calculate stats
+    total_failed = blocked + deactivated + not_started + unknown_error
+    success_rate = (sent / total * 100) if total > 0 else 0
+
+    # Build detailed result message
     result_text = (
-        f"📢 <b>Broadcast Finished</b>\n\n"
-        f"✅ <b>Sent:</b> {sent}\n"
-        f"❌ <b>Failed:</b> {failed}"
+        f"📢 <b>✅ Broadcast Complete!</b>\n\n"
+        f"<code>═══════════════════════</code>\n"
+        f"📊 <b>Total Users in DB:</b> {total}\n"
+        f"<code>═══════════════════════</code>\n"
+        f"✅ <b>Successfully Sent:</b> {sent}\n"
+        f"📈 <b>Success Rate:</b> {success_rate:.1f}%\n"
+        f"<code>═══════════════════════</code>\n"
+        f"❌ <b>Failed to Deliver:</b> {total_failed}\n"
+        f"  ├ 🚫 <b>Blocked Bot:</b> {blocked}\n"
+        f"  ├ 💀 <b>Deactivated Account:</b> {deactivated}\n"
+        f"  ├ 🔇 <b>Never Started Bot:</b> {not_started}\n"
+        f"  └ ⚠️ <b>Unknown Error:</b> {unknown_error}\n"
+        f"<code>═══════════════════════</code>\n\n"
     )
 
-    if message_id:
-        await message.bot.edit_message_text(
-            result_text,
-            chat_id=chat_id,
-            message_id=message_id,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="⬅ Back to Admin Panel", callback_data="admin_panel")]
-                ]
-            )
+    # Add explanation
+    if blocked > 0 or deactivated > 0 or not_started > 0:
+        result_text += (
+            "<b>ℹ️ Why so many failed?</b>\n"
         )
-    else:
-        await message.answer(result_text, parse_mode="HTML")
+        if not_started > 0:
+            result_text += "• <b>Never started:</b> Users who haven't sent /start to the bot cannot receive messages (Telegram API restriction)\n"
+        if blocked > 0:
+            result_text += "• <b>Blocked:</b> Users who blocked the bot\n"
+        if deactivated > 0:
+            result_text += "• <b>Deactivated:</b> Users who deleted their Telegram account\n"
+        result_text += "\n"
 
+    # Add error details if any unknown errors
+    if error_details:
+        result_text += (
+            f"<b>⚠️ Unknown Errors (first {len(error_details)}):</b>\n"
+            f"<code>{chr(10).join(error_details)}</code>\n\n"
+        )
+
+    result_text += "<i>💡 Only users who have started the bot and not blocked it can receive broadcasts.</i>"
+
+    await status_msg.edit_text(
+        result_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🔄 Broadcast Again", callback_data="admin_broadcast"),
+                    InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")
+                ]
+            ]
+        )
+    )
+
+    # Clear the FSM state
     await state.clear()
 
 

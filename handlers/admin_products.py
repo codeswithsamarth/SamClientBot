@@ -179,7 +179,7 @@ def _divider(char: str = "━", length: int = 30) -> str:
 
 @router.callback_query(F.data == "create_product")
 async def add_product(callback: CallbackQuery, state: FSMContext):
-    """Step 1/9: Ask for product name."""
+    """Step 1/10: Ask for product name."""
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Admin only.", show_alert=True)
         return
@@ -191,7 +191,7 @@ async def add_product(callback: CallbackQuery, state: FSMContext):
         "╔══════════════════════════════╗\n"
         "║  📦 CREATE NEW PRODUCT      ║\n"
         "╚══════════════════════════════╝\n\n"
-        "✏️ <b>Step 1/9: Product Name</b>\n\n"
+        "✏️ <b>Step 1/10: Product Name</b>\n\n"
         f"{_divider('─')}\n\n"
         "Send the product name.\n\n"
         "<i>Example: Gemini Advanced 1 Month</i>"
@@ -201,7 +201,7 @@ async def add_product(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AddProduct.name)
 async def product_name(message: Message, state: FSMContext):
-    """Step 2/9: Ask for icon."""
+    """Step 2/10: Ask for icon."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -220,7 +220,7 @@ async def product_name(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Name:</b> {name}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 2/9: Icon</b>\n\n"
+        f"✏️ <b>Step 2/10: Icon</b>\n\n"
         f"Send an emoji for this product.\n\n"
         f"<i>Example: 🎬 or 📧 or 🔑 or 🤖</i>"
     )
@@ -228,7 +228,7 @@ async def product_name(message: Message, state: FSMContext):
 
 @router.message(AddProduct.icon)
 async def product_icon(message: Message, state: FSMContext):
-    """Step 3/9: Ask for category."""
+    """Step 3/10: Ask for category."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -247,7 +247,7 @@ async def product_icon(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Icon:</b> {icon}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 3/9: Category</b>\n\n"
+        f"✏️ <b>Step 3/10: Category</b>\n\n"
         f"Send a category name.\n\n"
         f"<b>Available categories:</b>\n"
         f"• premium\n• budget\n• vpn\n• email\n"
@@ -258,7 +258,7 @@ async def product_icon(message: Message, state: FSMContext):
 
 @router.message(AddProduct.category)
 async def product_category(message: Message, state: FSMContext):
-    """Step 4/9: Ask for price."""
+    """Step 4/10: Ask for price."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -272,7 +272,7 @@ async def product_category(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Category:</b> {category}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 4/9: Price</b>\n\n"
+        f"✏️ <b>Step 4/10: Price</b>\n\n"
         f"Send the base price per unit (USD).\n\n"
         f"<i>Example: 9.99</i>\n\n"
         f"💡 <i>You'll be able to add bulk/tiered\n"
@@ -282,7 +282,7 @@ async def product_category(message: Message, state: FSMContext):
 
 @router.message(AddProduct.price)
 async def product_price(message: Message, state: FSMContext):
-    """Step 5/9: Ask for description."""
+    """Step 5/10: Ask for description."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -315,7 +315,7 @@ async def product_price(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Price:</b> ${price:.2f}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 5/9: Description</b>\n\n"
+        f"✏️ <b>Step 5/10: Description</b>\n\n"
         f"Send a description for this product.\n\n"
         f"<i>Example: Premium Gemini Advanced account\n"
         f"with 1-month validity. Includes all features.</i>\n\n"
@@ -325,7 +325,7 @@ async def product_price(message: Message, state: FSMContext):
 
 @router.message(AddProduct.description)
 async def product_description(message: Message, state: FSMContext):
-    """Step 6/9: Ask for delivery type."""
+    """Step 6/10: Ask for delivery type."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -343,7 +343,7 @@ async def product_description(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Description:</b> {desc if desc else '(empty)'}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 6/9: Delivery Type</b>\n\n"
+        f"✏️ <b>Step 6/10: Delivery Type</b>\n\n"
         f"Choose delivery type:\n"
         f"• 🟢 <b>automatic</b> — Instant auto-delivery\n"
         f"• 🟡 <b>manual</b> — Manual by admin team\n"
@@ -354,7 +354,7 @@ async def product_description(message: Message, state: FSMContext):
 
 @router.message(AddProduct.delivery_type)
 async def product_delivery(message: Message, state: FSMContext):
-    """Step 7/9: Ask if preorder is allowed."""
+    """Step 7/10: Ask for delivery instruction."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -374,7 +374,7 @@ async def product_delivery(message: Message, state: FSMContext):
         return
 
     await state.update_data(delivery_type=dt)
-    await state.set_state(AddProduct.preorder)
+    await state.set_state(AddProduct.delivery_instruction)
 
     delivery_labels = {
         "automatic": "🤖 Auto-Delivery",
@@ -385,7 +385,47 @@ async def product_delivery(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Delivery:</b> {delivery_labels.get(dt, dt)}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 7/9: Preorder</b>\n\n"
+        f"✏️ <b>Step 7/10: Delivery Instructions</b> <i>(Optional)</i>\n\n"
+        f"📋 <b>What are delivery instructions?</b>\n"
+        f"These are shown to the buyer AFTER a successful\n"
+        f"purchase. They appear as a clickable button in the\n"
+        f"purchase confirmation message.\n\n"
+        f"{_divider('─')}\n\n"
+        f"📝 <b>Examples of instructions:</b>\n"
+        f"  • \"Use a VPN when logging into this account\"\n"
+        f"  • \"Change password within 24 hours\"\n"
+        f"  • \"Account valid for 30 days — do not share\"\n"
+        f"  • \"Check spam folder for verification email\"\n"
+        f"  • \"Do not change recovery email or phone\"\n\n"
+        f"{_divider('─')}\n\n"
+        f"📤 <b>Send your instruction now</b>\n"
+        f"OR send <b>skip</b> for no instructions\n\n"
+        f"<i>This message will be shown as important\n"
+        f"information the buyer must read!</i>"
+    )
+
+
+@router.message(AddProduct.delivery_instruction)
+async def product_delivery_instruction(message: Message, state: FSMContext):
+    """Step 8/10: Ask if preorder is allowed."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if not message.text:
+        return
+
+    instruction = message.text.strip()
+
+    if instruction.lower() in ("skip", "none", "no", ""):
+        instruction = None
+
+    await state.update_data(delivery_instruction=instruction)
+    await state.set_state(AddProduct.preorder)
+
+    await message.answer(
+        f"✅ <b>Delivery Instruction:</b> {instruction if instruction else '(none set)'}\n\n"
+        f"{_divider('─')}\n\n"
+        f"✏️ <b>Step 8/10: Preorder</b>\n\n"
         f"Allow preorders when out of stock?\n\n"
         f"📦 <b>What are preorders?</b>\n"
         f"Users can buy even when stock is 0.\n"
@@ -396,7 +436,7 @@ async def product_delivery(message: Message, state: FSMContext):
 
 @router.message(AddProduct.preorder)
 async def product_preorder(message: Message, state: FSMContext):
-    """Step 8/9: Ask for bulk pricing (optional)."""
+    """Step 9/10: Ask for bulk pricing (optional)."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -412,7 +452,7 @@ async def product_preorder(message: Message, state: FSMContext):
     text = (
         f"✅ <b>Preorder:</b> {'🟢 Yes' if preorder else '🔴 No'}\n\n"
         f"{_divider('═')}\n\n"
-        f"✏️ <b>Step 8/9: Bulk Pricing</b> <i>(Optional)</i>\n\n"
+        f"✏️ <b>Step 9/10: Bulk Pricing</b> <i>(Optional)</i>\n\n"
         f"{_divider('─')}\n\n"
         f"📦 <b>Want to add tiered/bulk pricing?</b>\n\n"
         f"Buyers automatically get discounts\n"
@@ -437,7 +477,7 @@ async def product_preorder(message: Message, state: FSMContext):
 
 @router.message(AddProduct.bulk_pricing)
 async def product_bulk_pricing(message: Message, state: FSMContext):
-    """Step 9/9: Ask for accounts."""
+    """Step 10/10: Ask for accounts."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -455,7 +495,7 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
             f"✅ <b>Bulk Pricing:</b> Skipped\n"
             f"   └ Using flat pricing: base price applies to all quantities\n\n"
             f"{_divider('═')}\n\n"
-            f"✏️ <b>Step 9/9: Accounts</b>\n\n"
+            f"✏️ <b>Step 10/10: Accounts</b>\n\n"
             f"Send the accounts for this product.\n\n"
             f"<b>Format:</b> One account per line\n"
             f"<code>email1@gmail.com:password1</code>\n"
@@ -517,7 +557,7 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
     await state.set_state(AddProduct.accounts)
 
     confirm_lines.append(f"\n{_divider('═')}")
-    confirm_lines.append(f"\n✏️ <b>Step 9/9: Accounts</b>\n")
+    confirm_lines.append(f"\n✏️ <b>Step 10/10: Accounts</b>\n")
     confirm_lines.append("Send the accounts for this product.\n")
     confirm_lines.append("<b>Format:</b> One account per line\n")
     confirm_lines.append("<code>email1@gmail.com:password1</code>\n")
@@ -560,6 +600,7 @@ async def save_product(message: Message, state: FSMContext):
             file_content=file_content if file_content else None,
             is_active=True,
             delivery_type=data.get("delivery_type", "automatic"),
+            delivery_instruction=data.get("delivery_instruction", None),  # 🆕 NEW FIELD
             preorder=data.get("preorder", False),
             bulk_pricing=data.get("bulk_pricing", None),
             low_stock_threshold=3,
@@ -598,6 +639,16 @@ async def save_product(message: Message, state: FSMContext):
         f"🚚 <b>Delivery:</b> {product.delivery_type}",
         f"📦 <b>Preorder:</b> {'🟢 Yes' if product.preorder else '🔴 No'}",
     ]
+
+    # Delivery instruction section 🆕
+    text_parts.append(f"\n{_divider('─')}")
+    if product.delivery_instruction:
+        text_parts.append(f"\n📋 <b>Delivery Instructions:</b>")
+        text_parts.append(f"   └ \"{product.delivery_instruction[:200]}\"")
+        if len(product.delivery_instruction) > 200:
+            text_parts.append("   ...(truncated)")
+    else:
+        text_parts.append(f"\n📋 <b>Delivery Instructions:</b> ❌ Not set")
 
     # Bulk pricing section
     text_parts.append(f"\n{_divider('─')}")

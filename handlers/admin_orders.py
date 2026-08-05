@@ -474,10 +474,12 @@ def _do_deliver(order_id: int, delivered_text: str) -> dict:
         return {
             "order_id": order.id,
             "buyer_id": order.telegram_id,
+            "product_id": order.product_id,
             "product_name": order.product_name,
             "delivered_text": delivered_text,
             "commission_paid": commission_paid,
         }
+
 
 
 async def _dispatch_blocking(func, *args):
@@ -514,13 +516,81 @@ async def deliver_order_finish(message: Message, state: FSMContext):
         return
 
     try:
+        # Query the full order and product for the rich notification
+        db2 = SessionLocal()
+        try:
+            full_order = db2.query(Order).filter(Order.id == order_id).first()
+            product = db2.query(Product).filter(Product.id == result["product_id"]).first()
+            has_instruction = bool(product and product.delivery_instruction)
+            product_id_for_callback = result["product_id"]
+        finally:
+            db2.close()
+
+        # Build the formatted order message (same style as order_detail view)
+        status_config = {
+            "completed": {"emoji": "✅", "label": "Completed", "icon": "🟢", "progress": 100},
+        }.get(full_order.status, {"emoji": "✅", "label": "Completed", "icon": "🟢", "progress": 100})
+
+        progress_bar = "[" + "█" * 10 + "] 100%"
+
+        order_text = (
+            f"{status_config['icon']} <b>Order #{full_order.id}</b>\n"
+            f"   └ {status_config['emoji']} <b>{status_config['label']}</b>\n"
+            f"   └ Progress: {progress_bar}\n\n"
+            f"📦 <b>Product:</b> {full_order.product_name}\n"
+            f"🔢 <b>Quantity:</b> {full_order.quantity or 1}x\n"
+            f"💰 <b>Amount:</b> ${float(full_order.amount):.2f}\n"
+        )
+
+        if full_order.delivery_type:
+            delivery_labels = {
+                "automatic": "🤖 Auto-Delivery",
+                "manual": "👨‍💼 Manual Delivery",
+                "hybrid": "🔀 Hybrid",
+            }
+            dt_label = delivery_labels.get(full_order.delivery_type, full_order.delivery_type)
+            order_text += f"🏷 <b>Type:</b> {dt_label}\n"
+            order_text += f"⏱ <b>ETA:</b> {'Instant' if full_order.delivery_type == 'automatic' else 'Delivered'}\n"
+
+        order_text += (
+            f"\n🔑 <b>Delivered Details:</b>\n"
+            f"   <code>{result['delivered_text'][:200]}</code>\n"
+            f"\n📅 <b>Delivered:</b> {full_order.created_at.strftime('%d %b %Y, %I:%M %p') if full_order.created_at else 'N/A'}\n"
+            f"\n{'═' * 35}\n\n"
+            f"✅ <b>Order Completed!</b>\n\n"
+            f"🎉 <b>Enjoy your purchase!</b>\n"
+            f"💡 <i>Tip: Rate this order to help us improve.</i>\n\n"
+            f"<i>Thank you for your patience! 🙏</i>"
+        )
+
+        # Build keyboard with buttons
+        keyboard_buttons = []
+        if has_instruction:
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text="📋 📖 Delivery Instructions",
+                    callback_data=f"delivery_instruction_{product_id_for_callback}",
+                    style="primary"
+                )
+            ])
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="⭐ Rate This Order", callback_data=f"order_rate_{order_id}", style="success"),
+            InlineKeyboardButton(text="📎 Receipt", callback_data=f"order_receipt_{order_id}", style="primary")
+        ])
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="🔗 Share Order", callback_data=f"order_share_{order_id}", style="primary"),
+            InlineKeyboardButton(text="🔄 Refresh", callback_data=f"order_detail_{order_id}", style="primary")
+        ])
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="📋 All Orders", callback_data="orders_menu", style="primary"),
+            InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")
+        ])
+
         await message.bot.send_message(
             result["buyer_id"],
-            "✅ Your order has been delivered!\n\n"
-            f"📦 Product:\n{result['product_name']}\n\n"
-            "🔑 Details:\n\n"
-            f"<code>{result['delivered_text']}</code>",
-            parse_mode="HTML"
+            order_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
         )
     except Exception:
         logger.exception("Failed to notify buyer %s of delivery", result["buyer_id"])
@@ -529,27 +599,3 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             "buyer directly (they may have blocked the bot)."
         )
         return
-
-    commission = result.get("commission_paid")
-    if commission:
-        try:
-            await message.bot.send_message(
-                commission["referrer_telegram_id"],
-                "🎉 You earned a referral commission!\n\n"
-                f"💵 Amount: ${commission['amount']:.2f}\n"
-                "Thanks for sharing your link!"
-            )
-        except Exception:
-            logger.exception(
-                "Failed to notify referrer %s of commission",
-                commission["referrer_telegram_id"],
-            )
-
-    await message.answer(
-        "✅ Delivered and buyer notified.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⬅ Back to Orders", callback_data="admin_orders")]
-            ]
-        )
-    )

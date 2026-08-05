@@ -164,6 +164,16 @@ def _format_timestamp(dt: datetime, relative: bool = False) -> str:
     return dt.strftime("%d %b %Y, %I:%M %p")
 
 
+# 🆕 Fetch product helper
+def _fetch_product(product_id: int):
+    """Fetch a product by ID."""
+    db = SessionLocal()
+    try:
+        return db.query(Product).filter(Product.id == product_id).first()
+    finally:
+        db.close()
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              SUPPORT REDIRECT HANDLER                       ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -174,7 +184,7 @@ async def support_menu_redirect(callback: CallbackQuery):
     await callback.answer()
 
     text = (
-        f"{_border_box('SUPPORT CENTER', '🎫')}\n\n"
+        f"🎫 <b>SUPPORT CENTER</b>\n\n"
         f"👋 <b>Need help with your order?</b>\n\n"
         f"{_divider('─')}\n\n"
         f"📋 <b>Options:</b>\n\n"
@@ -304,7 +314,7 @@ def _format_orders_summary(orders: list) -> str:
 
     # Header with statistics
     header = (
-        f"{_border_box('YOUR ORDERS', '📦')}\n\n"
+        f"📦 <b>YOUR ORDERS</b>\n\n"
         f"{_divider('═')}\n"
         f"📊 <b>ANALYTICS DASHBOARD</b>\n"
         f"{_divider('═')}\n\n"
@@ -378,7 +388,7 @@ async def my_orders(callback: CallbackQuery):
         await show(
             callback,
             (
-                f"{_border_box('YOUR ORDERS', '📦')}\n\n"
+                f"📦 <b>YOUR ORDERS</b>\n\n"
                 f"📭 <b>No orders yet!</b>\n\n"
                 f"{_divider('─')}\n\n"
                 f"🛍 <b>Ready to start?</b>\n\n"
@@ -523,7 +533,7 @@ async def my_orders(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              ORDER DETAIL VIEW                              ║
+# ║              ORDER DETAIL VIEW 🆕 (with Delivery Instructions)║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("order_detail_"))
@@ -621,8 +631,26 @@ async def order_detail(callback: CallbackQuery):
 
     text += f"\n{status_messages.get(order.status, '')}"
 
+    # 🆕 Check if product has delivery instructions
+    has_instruction = False
+    product_id = getattr(order, "product_id", None)
+    if product_id:
+        product = _fetch_product(product_id)
+        if product and product.delivery_instruction:
+            has_instruction = True
+
     # Action buttons based on status
     action_buttons = []
+
+    # 🆕 Delivery Instructions button — shows for completed orders that have instructions
+    if order.status == "completed" and has_instruction:
+        action_buttons.append([
+            InlineKeyboardButton(
+                text="📋 📖 Delivery Instructions",
+                callback_data=f"delivery_instruction_{product_id}",
+                style="primary"
+            )
+        ])
 
     # Support button for active issues
     if order.status in ["pending_manual", "preorder", "pending"]:
@@ -701,6 +729,48 @@ async def order_detail(callback: CallbackQuery):
     markup = InlineKeyboardMarkup(inline_keyboard=action_buttons)
 
     await show(callback, text, parse_mode="HTML", reply_markup=markup)
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║         DELIVERY INSTRUCTION BUTTON HANDLER (ORDERS) 🆕    ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+@router.callback_query(F.data.startswith("delivery_instruction_"))
+async def show_delivery_instruction_from_orders(callback: CallbackQuery):
+    """Show delivery instruction when clicked from order detail view."""
+    await callback.answer()
+    product_id = int(callback.data.split("_")[2])
+    product = _fetch_product(product_id)
+
+    if not product or not product.delivery_instruction:
+        await callback.answer("📋 No delivery instructions available.", show_alert=True)
+        return
+
+    text = (
+        f"╔{'═' * 30}╗\n"
+        f"║  📋 DELIVERY INSTRUCTIONS      ║\n"
+        f"╚{'═' * 30}╝\n\n"
+        f"<b>{product.icon or '📦'} {product.name}</b>\n\n"
+        f"{'─' * 30}\n\n"
+        f"<b>⚠️ IMPORTANT — READ CAREFULLY:</b>\n\n"
+        f"<blockquote>{product.delivery_instruction}</blockquote>\n\n"
+        f"{'═' * 30}\n\n"
+        f"<i>💡 Please follow these instructions carefully\n"
+        f"to ensure a smooth experience.</i>\n\n"
+        f"<i>If you have any issues, contact support!</i>"
+    )
+
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Back to Orders", callback_data="orders_menu", style="success"),
+                 InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+            ]
+        )
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -798,7 +868,7 @@ async def order_rate(callback: CallbackQuery):
     existing = _order_ratings.get(order_id, {}).get("rating")
 
     text = (
-        f"{_border_box('RATE YOUR ORDER', '⭐')}\n\n"
+        f"⭐ <b>RATE YOUR ORDER</b>\n\n"
         f"📦 <b>Order #{order_id}</b>\n\n"
         f"{_divider('─')}\n\n"
         f"How was your experience?\n\n"
@@ -883,8 +953,7 @@ async def handle_order_rating(callback: CallbackQuery):
     await show(
         callback,
         (
-            f"{_border_box('RATING SAVED', rating_emoji[rating])}\n\n"
-            f"📦 <b>Order #{order_id}</b>\n\n"
+            f"{rating_emoji[rating]} <b>RATING SAVED</b>\n\n"            f"📦 <b>Order #{order_id}</b>\n\n"
             f"Your rating: {stars}\n"
             f"Rating: <b>{rating_labels[rating]}</b>\n\n"
             f"{_divider('─')}\n\n"
@@ -955,7 +1024,7 @@ async def order_share(callback: CallbackQuery):
     await show(
         callback,
         (
-            f"{_border_box('SHARE ORDER', '🔗')}\n\n"
+            f"🔗 <b>SHARE ORDER</b>\n\n"
             f"📤 <b>Shareable Card:</b>\n\n"
             f"<blockquote>{share_text}</blockquote>\n\n"
             f"{_divider('─')}\n\n"
@@ -990,7 +1059,7 @@ async def order_filter_menu(callback: CallbackQuery):
     await callback.answer()
 
     text = (
-        f"{_border_box('FILTER ORDERS', '🔍')}\n\n"
+        f"🔍 <b>FILTER ORDERS</b>\n\n"
         f"📊 <b>Filter by:</b>\n\n"
         f"{_divider('─')}\n\n"
         f"  🟢 <b>Completed</b> — Only delivered\n"
@@ -1102,7 +1171,7 @@ async def apply_order_filter(callback: CallbackQuery):
         db.close()
 
     text = (
-        f"{_border_box('FILTERED RESULTS', '🔍')}\n\n"
+        f"🔍 <b>FILTERED RESULTS</b>\n\n"
         f"📊 <b>Filter:</b> {filter_label}\n"
         f"📦 <b>Found:</b> {len(orders)} order(s)\n\n"
         f"{_divider('═')}\n\n"
@@ -1169,7 +1238,7 @@ async def order_search_by_id(callback: CallbackQuery, state: FSMContext):
     await show(
         callback,
         (
-            f"{_border_box('SEARCH ORDER', '🔍')}\n\n"
+            f"🔍 <b>SEARCH ORDER</b>\n\n"
             f"🔢 <b>Enter the Order ID:</b>\n\n"
             f"{_divider('─')}\n\n"
             f"💡 <i>Example: 42</i>\n"
@@ -1272,7 +1341,7 @@ async def order_export_menu(callback: CallbackQuery):
     await callback.answer()
 
     text = (
-        f"{_border_box('EXPORT ORDERS', '📤')}\n\n"
+        f"📤 <b>EXPORT ORDERS</b>\n\n"
         f"📊 <b>Export your order history:</b>\n\n"
         f"{_divider('─')}\n\n"
         f"  📄 <b>CSV Format</b> — Open in Excel\n"
@@ -1439,7 +1508,7 @@ async def order_analytics(callback: CallbackQuery):
         db.close()
 
     text = (
-        f"{_border_box('ANALYTICS DASHBOARD', '📊')}\n\n"
+        f"📊 <b>ANALYTICS DASHBOARD</b>\n\n"
         f"{_divider('═')}\n"
         f"📈 <b>OVERVIEW</b>\n"
         f"{_divider('═')}\n\n"
@@ -1527,7 +1596,7 @@ async def orders_view_all(callback: CallbackQuery):
         return
 
     text = (
-        f"{_border_box('ALL ORDERS', '📋')}\n\n"
+        f"📋 <b>ALL ORDERS</b>\n\n"
         f"📦 <b>{len(orders)} total orders</b>\n\n"
     )
 

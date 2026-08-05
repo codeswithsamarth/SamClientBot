@@ -53,7 +53,8 @@ MONEY_QUANT = Decimal("0.00000001")
 # ---- Stock notification channel settings (config.py) -----------------
 STOCK_GROUP_ID = getattr(config, "STOCK_GROUP_ID", None)
 STOCK_NOTIFICATIONS = getattr(config, "STOCK_NOTIFICATIONS", True)
-
+GROUP_ID = getattr(config, "GROUP_ID", None)
+GROUP_NOTIFICATIONS = getattr(config, "GROUP_NOTIFICATIONS", False)
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                   UI HELPERS                                ║
@@ -179,7 +180,7 @@ def _format_bulk_pricing_text(bulk_pricing) -> str:
         max_q = tier.get("max")
         price = tier.get("price", 0)
 
-        if max_q:
+        if max_q is not None:
             lines.append(f"  🏷 {min_q}-{max_q} units → <b>${float(price):.2f}</b>/each")
         else:
             lines.append(f"  🏷 {min_q}+ units → <b>${float(price):.2f}</b>/each")
@@ -571,7 +572,7 @@ async def freebies_menu(callback: CallbackQuery):
         await show(
             callback,
             (
-                f"{_border_box('FREEBIES', '🎁')}\n\n"
+                f"🎁 <b>FREEBIES</b>\n\n"
                 f"📭 <b>No free products available right now.</b>\n\n"
                 f"{_divider('─', 28)}\n\n"
                 f"💡 Check back later — free products\n"
@@ -591,7 +592,7 @@ async def freebies_menu(callback: CallbackQuery):
     _fire_stock_scan(callback.bot, products)
 
     text = (
-        f"{_border_box('FREEBIES', '🎁')}\n\n"
+        f"🎁 <b>FREEBIES</b>\n\n"
         f"<b>🎉 Free Products Available!</b>\n\n"
         f"{_divider('─', 28)}\n"
         f"<b>📊 Total Free Items:</b> {len(products)}\n\n"
@@ -636,7 +637,7 @@ async def products_menu(callback: CallbackQuery):
         await show(
             callback,
             (
-                f"{_border_box('PRODUCTS', '📦')}\n\n"
+                f"📦 <b>PRODUCTS</b>\n\n"
                 f"📭 <b>No paid products available right now.</b>\n\n"
                 f"{_divider('─', 28)}\n\n"
                 f"💡 Check back later or contact support\n"
@@ -664,7 +665,7 @@ async def products_menu(callback: CallbackQuery):
         categories[cat_key]["count"] += 1
 
     text = (
-        f"{_border_box('PRODUCT CATALOG', '🛍')}\n\n"
+        f"🛍 <b>PRODUCT CATALOG</b>\n\n"
         f"<b>📊 Available Products:</b> {len(products)}\n"
         f"<i>🎁 Free products available in Freebies section</i>\n\n"
         f"{_divider('─', 28)}\n"
@@ -734,7 +735,7 @@ async def favorites_menu(callback: CallbackQuery):
         await show(
             callback,
             (
-                f"{_border_box('FAVORITES', '⭐')}\n\n"
+                f"⭐ <b>FAVORITES</b>\n\n"
                 f"📭 <b>No favorites yet!</b>\n\n"
                 f"{_divider('─', 28)}\n\n"
                 f"💡 <b>How to add:</b>\n"
@@ -763,7 +764,7 @@ async def favorites_menu(callback: CallbackQuery):
         return
 
     text = (
-        f"{_border_box('YOUR FAVORITES', '⭐')}\n\n"
+        f"⭐ <b>YOUR FAVORITES</b>\n\n"
         f"❤️ <b>{len(products)} favorite item(s):</b>\n\n"
         f"{_divider('─', 28)}\n\n"
     )
@@ -823,7 +824,7 @@ async def notify_when_available(callback: CallbackQuery):
 
     if is_new:
         text = (
-            f"{_border_box('NOTIFICATION SET', '🔔')}\n\n"
+            f"🔔 <b>NOTIFICATION SET</b>\n\n"
             f"🔔 <b>You'll be notified when this is back in stock!</b>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"📦 <b>Product:</b> {product.icon or cat_config['icon']} {product.name}\n"
@@ -837,7 +838,7 @@ async def notify_when_available(callback: CallbackQuery):
         )
     else:
         text = (
-            f"{_border_box('ALREADY SUBSCRIBED', '🔔')}\n\n"
+            f"🔔 <b>ALREADY SUBSCRIBED</b>\n\n"
             f"✅ <b>You're already on the notification list!</b>\n\n"
             f"📦 {product.icon or cat_config['icon']} <b>{product.name}</b>\n\n"
             f"We'll message you as soon as it's available.\n\n"
@@ -877,7 +878,7 @@ async def search_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SearchStates.waiting_query)
 
     text = (
-        f"{_border_box('SEARCH PRODUCTS', '🔍')}\n\n"
+        f"🔍 <b>SEARCH PRODUCTS</b>\n\n"
         f"<b>What are you looking for?</b>\n\n"
         f"{_divider('─', 28)}\n\n"
         f"💡 <b>Search tips:</b>\n"
@@ -903,8 +904,7 @@ async def search_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     await show(callback,
-        f"{_border_box('SEARCH CANCELLED', '❌')}\n\n<b>Search cancelled.</b>\n\nBrowse all products or try again later.",
-        parse_mode="HTML",
+               f"❌ <b>SEARCH CANCELLED</b>\n\n<b>Search cancelled.</b>\n\nBrowse all products or try again later.",        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success")],
@@ -951,7 +951,7 @@ async def search_results(message: Message, state: FSMContext):
 
     if not products:
         text = (
-            f"{_border_box('NO RESULTS', '🔍')}\n\n"
+            f"🔍 <b>NO RESULTS</b>\n\n"
             f"📭 <b>No products found for:</b>\n<code>{_esc(query)}</code>\n\n"
             f"{_divider('─', 28)}\n\n"
             f"💡 <b>Suggestions:</b>\n• Try different keywords\n• Check spelling\n• Browse all categories\n\n"
@@ -966,7 +966,7 @@ async def search_results(message: Message, state: FSMContext):
     else:
         plural = "s" if len(products) != 1 else ""
         text = (
-            f"{_border_box('SEARCH RESULTS', '🔍')}\n\n"
+            f"🔍 <b>SEARCH RESULTS</b>\n\n"
             f"✅ <b>Found {len(products)} product{plural}</b>\nfor: <code>{_esc(query)}</code>\n\n"
             f"{_divider('─', 28)}\n\n"
         )
@@ -1026,8 +1026,7 @@ async def product_info(callback: CallbackQuery):
 
     if not product:
         await show(callback,
-            f"{_border_box('NOT FOUND', '❌')}\n\n<b>This product is no longer available.</b>",
-            parse_mode="HTML",
+                   f"❌ <b>NOT FOUND</b>\n\n<b>This product is no longer available.</b>",            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")],
@@ -1057,8 +1056,11 @@ async def product_info(callback: CallbackQuery):
     # Check if product is free
     is_free = float(product.price) == 0
 
+    # Check if delivery instruction exists 🆕
+    has_instruction = bool(product.delivery_instruction)
+
     text = (
-        f"{_border_box('PRODUCT DETAILS', product.icon or '📦')}\n\n"
+        f"{product.icon or '📦'} <b>PRODUCT DETAILS</b>\n\n"
         f"<b>{product.icon or cat_config['icon']} {_esc(product.name)}</b> {fav_star}\n"
         f"🏷 {cat_config['color']} <b>{cat_config['label']}</b>\n\n"
         f"{_divider('─', 28)}\n\n"
@@ -1067,6 +1069,7 @@ async def product_info(callback: CallbackQuery):
         f"{_divider('─', 28)}\n\n"
         f"<b>📊 Product Info:</b>\n"
     )
+
 
     if is_free:
         text += f"  🎁 <b>Price:</b> <code>FREE!</code>\n"
@@ -1084,6 +1087,10 @@ async def product_info(callback: CallbackQuery):
 
     if product.preorder:
         text += f"  📦 <b>Preorder:</b> ✅ Available\n"
+
+    # 🆕 Show delivery instruction indicator
+    if has_instruction:
+        text += f"  📋 <b>Instructions:</b> ✅ Available (shown after purchase)\n"
 
     # Bulk pricing section - only for paid products
     if not is_free:
@@ -1149,7 +1156,7 @@ def _qty_text(product, qty: int, real_stock_available: bool) -> str:
         cat_config = _get_category_config(product.category)
         header = "🎁 FREE CLAIM" if real_stock_available else "📦 PREORDER (FREE)"
         return (
-            f"{_border_box(header, product.icon or '🎁')}\n\n"
+            f"{product.icon or '🎁'} <b>{header}</b>\n\n"
             f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
             f"🏷 {cat_config['color']} {cat_config['label']}\n\n"
             f"{_divider('─', 28)}\n\n"
@@ -1174,7 +1181,7 @@ def _qty_text(product, qty: int, real_stock_available: bool) -> str:
                 savings_per_unit = _money(product.price) - actual_price
                 total_savings = savings_per_unit * qty
                 discount_note = (
-                    f"\n🎉 <b>Bulk Discount Applied!</b>\n"
+                    f"  🎉 <b>Bulk Discount Applied!</b>\n"
                     f"  └ 💰 ${actual_price:.2f}/each (saved ${total_savings:.2f} total!)\n"
                 )
 
@@ -1182,7 +1189,7 @@ def _qty_text(product, qty: int, real_stock_available: bool) -> str:
     cat_config = _get_category_config(product.category)
     header = "📦 PREORDER" if not real_stock_available else "🛒 PURCHASE"
     return (
-        f"{_border_box(header, product.icon or '📦')}\n\n"
+        f"{product.icon or '📦'} <b>{header}</b>\n\n"
         f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
         f"🏷 {cat_config['color']} {cat_config['label']}\n\n"
         f"{_divider('─', 28)}\n\n"
@@ -1233,8 +1240,7 @@ async def select_qty(callback: CallbackQuery, state: FSMContext):
     max_qty = _get_max_qty(product)
     if max_qty <= 0:
         await show(callback,
-            f"{_border_box('OUT OF STOCK', '❌')}\n\n<b>This product is currently unavailable.</b>",
-            parse_mode="HTML",
+                   f"❌ <b>OUT OF STOCK</b>\n\n<b>This product is currently unavailable.</b>",            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🛍 Browse Other Products", callback_data="products_menu", style="success")],
                 [InlineKeyboardButton(text="🔔 Notify When Available", callback_data=f"notify_available_{product_id}", style="primary")]
@@ -1247,7 +1253,7 @@ async def select_qty(callback: CallbackQuery, state: FSMContext):
 
     if is_free:
         text = (
-            f"{_border_box('CLAIM FREE PRODUCT', '🎁')}\n\n"
+            f"🎁 <b>CLAIM FREE PRODUCT</b>\n\n"
             f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
             f"🎁 <b>Price:</b> FREE! 🎉\n"
             f"📦 <b>Available:</b> {max_qty} units\n\n"
@@ -1259,13 +1265,13 @@ async def select_qty(callback: CallbackQuery, state: FSMContext):
         has_bulk = bool(product.bulk_pricing)
         bulk_info = ""
         if has_bulk:
-            bulk_info = "\n\n📦 <b>💰 Bulk Discounts Available!</b>\n"
+            bulk_info = "\n📦 <b>💰 Bulk Discounts Available!</b>\n"
             bulk_tiers = _format_bulk_pricing_text(product.bulk_pricing)
             bulk_info += bulk_tiers
             bulk_info += "\n\n<i>The price adjusts automatically based on your quantity!</i>"
 
         text = (
-            f"{_border_box('SELECT QUANTITY', '🔢')}\n\n"
+            f"🔢 <b>SELECT QUANTITY</b>\n\n"
             f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
             f"💰 <b>Base Price:</b> ${_money(product.price):.2f} each\n"
             f"📦 <b>Available:</b> {max_qty} units\n"
@@ -1349,8 +1355,7 @@ async def cancel_buy(callback: CallbackQuery, state: FSMContext):
     await state.update_data(**{f"qty_{product_id}": 1})
     await state.clear()
     await show(callback,
-        f"{_border_box('CANCELLED', '❌')}\n\n<b>Purchase cancelled.</b>\n\nYour balance has not been charged.",
-        parse_mode="HTML",
+               f"❌ <b>CANCELLED</b>\n\n<b>Purchase cancelled.</b>\n\nYour balance has not been charged.",        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success"),
              InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
@@ -1381,15 +1386,15 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
         # 🎁 Freebie limit: one claim per user per free product
         if float(product.price) == 0:
             already_claimed = (
-                                  db.query(Order)
-                                  .filter(
-                                      Order.telegram_id == telegram_id,
-                                      Order.product_id == product.id,
-                                      Order.status.in_(["completed", "pending_manual", "preorder"]),
-                                      Order.refunded == False
-                                  )
-                                  .count()
-                              ) > 0
+                db.query(Order)
+                .filter(
+                    Order.telegram_id == telegram_id,
+                    Order.product_id == product.id,
+                    Order.status.in_(["completed", "pending_manual", "preorder"]),
+                    Order.refunded == False
+                )
+                .count()
+            ) > 0
             if already_claimed:
                 return {
                     "error": (
@@ -1400,15 +1405,22 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
                     )
                 }
 
-        # Check for bulk pricing - apply discounted price if applicable
+        # Apply bulk pricing if applicable
         price = _money(product.price)
-
+        if product.bulk_pricing:
+            bulk_price = _get_bulk_price(product.bulk_pricing, quantity)
+            if bulk_price is not None:
+                price = _money(bulk_price)
 
         total_amount = _money(price * quantity)
         user_balance = _money(user.balance)
 
         if user_balance < total_amount:
-            return {"error": f"Insufficient balance.\n\n💰 Cost: ${total_amount:.2f}\n💳 Your balance: ${user_balance:.2f}\n\nPlease deposit more funds."}
+            return {
+                "error": "insufficient_balance",
+                "total_price": float(total_amount),
+                "balance": float(user_balance)
+            }
 
         delivery_type = (product.delivery_type or "automatic").lower()
         threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
@@ -1471,12 +1483,14 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
         if not is_preorder_order and stock_before > threshold >= new_stock:
             low_stock_alert = {"product_id": product.id, "product_name": product.name, "stock": new_stock, "threshold": threshold}
 
+        # 🆕 Include delivery_instruction in result
         result = {
             "order_id": order.id, "icon": product.icon, "name": product.name,
             "delivered_accounts": delivered_accounts, "balance": user.balance,
             "stock": new_stock, "status": status, "is_preorder": is_preorder_order,
             "quantity": quantity, "total_price": total_amount, "price_per_unit": price,
             "low_stock_alert": low_stock_alert, "referral_commission_paid": referral_commission_paid,
+            "delivery_instruction": product.delivery_instruction,  # 🆕
         }
     return result
 
@@ -1505,6 +1519,50 @@ async def _notify_admins_pending_order(bot, buyer_id: int, result: dict):
                 f"📋 <b>Action Required:</b>\nAdmin → Orders → #{result['order_id']} → Deliver", parse_mode="HTML")
         except Exception:
             logger.exception("Failed to notify admin %s of pending order", admin_id)
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║         DELIVERY INSTRUCTION BUTTON HANDLER 🆕              ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+@router.callback_query(F.data.startswith("delivery_instruction_"))
+async def show_delivery_instruction(callback: CallbackQuery):
+    """Show delivery instruction when user clicks the button after purchase."""
+    await callback.answer()
+    product_id = int(callback.data.split("_")[2])
+    product = await asyncio.to_thread(_fetch_product, product_id)
+
+    if not product or not product.delivery_instruction:
+        await callback.answer("📋 No delivery instructions available.", show_alert=True)
+        return
+
+    cat_config = _get_category_config(product.category)
+
+    text = (
+        f"╔{'═' * 30}╗\n"
+        f"║  📋 DELIVERY INSTRUCTIONS      ║\n"
+        f"╚{'═' * 30}╝\n\n"
+        f"<b>{product.icon or cat_config['icon']} {_esc(product.name)}</b>\n\n"
+        f"{'─' * 30}\n\n"
+        f"<b>⚠️ IMPORTANT — READ CAREFULLY:</b>\n\n"
+        f"<blockquote>{_esc(product.delivery_instruction)}</blockquote>\n\n"
+        f"{'═' * 30}\n\n"
+        f"<i>💡 Please follow these instructions carefully\n"
+        f"to ensure a smooth experience.</i>\n\n"
+        f"<i>If you have any issues, contact support!</i>"
+    )
+
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📜 View Orders", callback_data="orders_menu", style="success"),
+                 InlineKeyboardButton(text="🛍 Buy More", callback_data="products_menu", style="primary")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+            ]
+        )
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1550,18 +1608,20 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
 
         if "error" in result:
             error_msg = result["error"]
-            is_insufficient = "insufficient balance" in error_msg.lower()
+            is_insufficient = error_msg == "insufficient_balance"
 
             if is_insufficient:
+                total_price = result.get("total_price", 0)
+                balance = result.get("balance", 0)
                 text = (
                     f"╔{'═' * 30}╗\n"
-                    f"║  💸 INSUFFICIENT BALANCE{' ' * 8}║\n"
+                    f"║  💸 INSUFFICIENT BALANCE        ║\n"
                     f"╚{'═' * 30}╝\n\n"
                     f"😔 <b>Oops! You don't have enough funds.</b>\n\n"
                     f"{'─' * 30}\n\n"
                     f"🛒 <b>Order Summary:</b>\n"
-                    f"   💰 <b>Cost:</b> <code>${result.get('total_price', 0):.2f}</code>\n"
-                    f"   💳 <b>Your Balance:</b> <code>${result.get('balance', 0):.2f}</code>\n\n"
+                    f"   💰 <b>Cost:</b> <code>${total_price:.2f}</code>\n"
+                    f"   💳 <b>Your Balance:</b> <code>${balance:.2f}</code>\n\n"
                     f"{'─' * 30}\n\n"
                     f"💡 <b>What would you like to do?</b>\n\n"
                     f"  🏦 <b>Deposit Funds</b> — Add money to\n"
@@ -1602,7 +1662,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
             else:
                 text = (
                     f"╔{'═' * 30}╗\n"
-                    f"║  ❌ PURCHASE FAILED{' ' * 11}║\n"
+                    f"║  ❌ PURCHASE FAILED             ║\n"
                     f"╚{'═' * 30}╝\n\n"
                     f"⚠️ <b>{error_msg}</b>\n\n"
                     f"{'─' * 30}\n\n"
@@ -1637,7 +1697,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
             return
 
         # Group notification (purchase / deposit channel — config.GROUP_ID)
-        if getattr(config, 'GROUP_NOTIFICATIONS', False) and hasattr(config, 'GROUP_ID'):
+        if GROUP_NOTIFICATIONS and GROUP_ID:
             try:
                 now = datetime.now().strftime("%d-%b-%Y %I:%M %p IST")
                 uid = str(telegram_id)
@@ -1657,7 +1717,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     "<code>Wallet synchronized.</code>"
                 )
                 await callback.bot.send_message(
-                    chat_id=config.GROUP_ID,
+                    chat_id=GROUP_ID,
                     text=group_msg,
                     parse_mode="HTML",
                 )
@@ -1665,54 +1725,111 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                 logger.exception("Failed to send group purchase notification")
 
         is_free = float(result.get("total_price", 0)) == 0
+        delivery_instruction = result.get("delivery_instruction")
+
+        # Helper: Build all reply_markup buttons with optional delivery instruction button
+        def _build_success_keyboard(product_id: int, has_instruction: bool) -> InlineKeyboardMarkup:
+            buttons = []
+            if has_instruction:
+                buttons.append([
+                    InlineKeyboardButton(
+                        text="📋 📖 Delivery Instructions",
+                        callback_data=f"delivery_instruction_{product_id}",
+                        style="primary"
+                    )
+                ])
+            buttons.append([
+                InlineKeyboardButton(text="📜 View Orders", callback_data="orders_menu", style="success"),
+                InlineKeyboardButton(text="🛍 Buy More", callback_data="products_menu", style="primary")
+            ])
+            buttons.append([
+                InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")
+            ])
+            return InlineKeyboardMarkup(inline_keyboard=buttons)
 
         if result["status"] == "completed":
             joined_accounts = "\n".join(f"  {i + 1}. <code>{acc}</code>" for i, acc in enumerate(result["delivered_accounts"]))
+            has_instr = bool(delivery_instruction)
+
             if is_free:
                 text = (
-                    f"{_border_box('FREEBIE CLAIMED!', '🎁')}\n\n🎉 <b>Your free product has been delivered!</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"🆔 <b>Order:</b> #{result['order_id']}\n🎁 <b>Product:</b> {result['icon']} {result['name']}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n💰 <b>Charged:</b> $0.00 🎉\n\n"
-                    f"{_divider('─', 28)}\n\n🔑 <b>Your Accounts:</b>\n\n{joined_accounts}\n\n"
-                    f"{_divider('═', 28)}\n\n💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n"
-                    f"📦 <b>Stock Left:</b> {result['stock']} units\n\n<i>Enjoy your free product! 🎉</i>"
+                    f"╔{'═' * 34}╗\n"
+                    f"║  🎁 FREEBIE CLAIMED!           ║\n"
+                    f"╚{'═' * 34}╝\n\n"
+                    f"🎉 <b>Your free product has been delivered!</b>\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🆔 <b>Order:</b> #{result['order_id']}\n"
+                    f"🎁 <b>Product:</b> {result['icon']} {result['name']}\n"
+                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                    f"💰 <b>Charged:</b> $0.00 🎉\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🔑 <b>Your Accounts:</b>\n\n{joined_accounts}\n\n"
+                    f"{'═' * 34}\n\n"
+                    f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n"
+                    f"📦 <b>Stock Left:</b> {result['stock']} units\n\n"
+                    f"<i>Enjoy your free product! 🎉</i>"
                 )
+                if has_instr:
+                    text += f"\n\n📋 <b>⚠️ Important:</b> Tap <b>Delivery Instructions</b> below!"
             else:
                 text = (
-                    f"{_border_box('PURCHASE SUCCESSFUL', '✅')}\n\n🎉 <b>Your order has been delivered!</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"🆔 <b>Order:</b> #{result['order_id']}\n📦 <b>Product:</b> {result['icon']} {result['name']}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n💰 <b>Charged:</b> ${result['total_price']:.2f}\n\n"
-                    f"{_divider('─', 28)}\n\n🔑 <b>Your Accounts:</b>\n\n{joined_accounts}\n\n"
-                    f"{_divider('═', 28)}\n\n💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n"
-                    f"📦 <b>Stock Left:</b> {result['stock']} units\n\n<i>Thank you for your purchase! 🙏</i>"
+                    f"╔{'═' * 34}╗\n"
+                    f"║  ✅ PURCHASE SUCCESSFUL        ║\n"
+                    f"╚{'═' * 34}╝\n\n"
+                    f"🎉 <b>Your order has been delivered!</b>\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🆔 <b>Order:</b> #{result['order_id']}\n"
+                    f"📦 <b>Product:</b> {result['icon']} {result['name']}\n"
+                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                    f"💰 <b>Charged:</b> ${result['total_price']:.2f}\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🔑 <b>Your Accounts:</b>\n\n{joined_accounts}\n\n"
+                    f"{'═' * 34}\n\n"
+                    f"💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n"
+                    f"📦 <b>Stock Left:</b> {result['stock']} units\n\n"
+                    f"<i>Thank you for your purchase! 🙏</i>"
                 )
-            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📜 View Orders", callback_data="orders_menu", style="success"),
-                 InlineKeyboardButton(text="🛍 Buy More", callback_data="products_menu", style="primary")],
-                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-            ])
+                if has_instr:
+                    text += f"\n\n📋 <b>⚠️ Important:</b> Tap <b>Delivery Instructions</b> below!"
+
+            reply_markup = _build_success_keyboard(product_id, has_instr)
+
         elif result["status"] == "preorder":
             if is_free:
                 text = (
-                    f"{_border_box('PREORDER PLACED', '🎁')}\n\n📦 <b>Your free preorder has been confirmed!</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"🆔 <b>Order:</b> #{result['order_id']}\n🎁 <b>Product:</b> {result['icon']} {result['name']}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n💰 <b>Charged:</b> $0.00 🎉\n\n"
-                    f"{_divider('─', 28)}\n\n⏳ <b>Status:</b> Awaiting Restock\n"
-                    f"📦 <b>Delivery:</b> You'll receive a message as soon as stock is available.\n\n"
-                    f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n\n<i>We'll notify you when it's ready! 🔔</i>"
+                    f"╔{'═' * 34}╗\n"
+                    f"║  📦 PREORDER PLACED            ║\n"
+                    f"╚{'═' * 34}╝\n\n"
+                    f"📦 <b>Your preorder has been confirmed!</b>\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🆔 <b>Order:</b> #{result['order_id']}\n"
+                    f"🎁 <b>Product:</b> {result['icon']} {result['name']}\n"
+                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                    f"💰 <b>Charged:</b> $0.00 🎉\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"⏳ <b>Status:</b> Awaiting Restock\n"
+                    f"📦 <b>Delivery:</b> You'll receive a message\n"
+                    f"as soon as stock is available.\n\n"
+                    f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n\n"
+                    f"<i>We'll notify you when it's ready! 🔔</i>"
                 )
             else:
                 text = (
-                    f"{_border_box('PREORDER PLACED', '📦')}\n\n📦 <b>Your preorder has been confirmed!</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"🆔 <b>Order:</b> #{result['order_id']}\n📦 <b>Product:</b> {result['icon']} {result['name']}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n💰 <b>Charged:</b> ${result['total_price']:.2f}\n\n"
-                    f"{_divider('─', 28)}\n\n⏳ <b>Status:</b> Awaiting Restock\n"
-                    f"📦 <b>Delivery:</b> You'll receive a message as soon as stock is available.\n\n"
-                    f"💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n\n<i>We'll notify you when it's ready! 🔔</i>"
+                    f"╔{'═' * 34}╗\n"
+                    f"║  📦 PREORDER PLACED            ║\n"
+                    f"╚{'═' * 34}╝\n\n"
+                    f"📦 <b>Your preorder has been confirmed!</b>\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🆔 <b>Order:</b> #{result['order_id']}\n"
+                    f"📦 <b>Product:</b> {result['icon']} {result['name']}\n"
+                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                    f"💰 <b>Charged:</b> ${result['total_price']:.2f}\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"⏳ <b>Status:</b> Awaiting Restock\n"
+                    f"📦 <b>Delivery:</b> You'll receive a message\n"
+                    f"as soon as stock is available.\n\n"
+                    f"💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n\n"
+                    f"<i>We'll notify you when it's ready! 🔔</i>"
                 )
             reply_markup = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📜 Track Order", callback_data="orders_menu", style="primary"),
@@ -1720,31 +1837,59 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
             ])
         else:
+            # pending_manual status
+            has_instr = bool(delivery_instruction)
+
             if is_free:
                 text = (
-                    f"{_border_box('ORDER RECEIVED', '⏳')}\n\n⏳ <b>Your free order is being processed!</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"🆔 <b>Order:</b> #{result['order_id']}\n🎁 <b>Product:</b> {result['icon']} {result['name']}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n💰 <b>Charged:</b> $0.00 🎉\n\n"
-                    f"{_divider('─', 28)}\n\n👨‍💼 <b>Delivery:</b> Manual by our team\n"
-                    f"⏱ <b>ETA:</b> Usually within 24 hours\n🔔 <b>Notification:</b> You'll receive a message when it's delivered.\n\n"
-                    f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n\n<i>Our team is on it! 🚀</i>"
+                    f"╔{'═' * 34}╗\n"
+                    f"║  ⏳ ORDER RECEIVED             ║\n"
+                    f"╚{'═' * 34}╝\n\n"
+                    f"⏳ <b>Your free order is being processed!</b>\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🆔 <b>Order:</b> #{result['order_id']}\n"
+                    f"🎁 <b>Product:</b> {result['icon']} {result['name']}\n"
+                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                    f"💰 <b>Charged:</b> $0.00 🎉\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"👨‍💼 <b>Delivery:</b> Manual by our team\n"
+                    f"⏱ <b>ETA:</b> Usually within 24 hours\n"
+                    f"🔔 <b>Notification:</b> You'll receive\n"
+                    f"a message when it's delivered.\n\n"
+                    f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n\n"
+                    f"<i>Our team is on it! 🚀</i>"
                 )
             else:
                 text = (
-                    f"{_border_box('ORDER RECEIVED', '⏳')}\n\n⏳ <b>Your order is being processed!</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"🆔 <b>Order:</b> #{result['order_id']}\n📦 <b>Product:</b> {result['icon']} {result['name']}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n💰 <b>Charged:</b> ${result['total_price']:.2f}\n\n"
-                    f"{_divider('─', 28)}\n\n👨‍💼 <b>Delivery:</b> Manual by our team\n"
-                    f"⏱ <b>ETA:</b> Usually within 24 hours\n🔔 <b>Notification:</b> You'll receive a message when it's delivered.\n\n"
-                    f"💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n\n<i>Our team is on it! 🚀</i>"
+                    f"╔{'═' * 34}╗\n"
+                    f"║  ⏳ ORDER RECEIVED             ║\n"
+                    f"╚{'═' * 34}╝\n\n"
+                    f"⏳ <b>Your order is being processed!</b>\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"🆔 <b>Order:</b> #{result['order_id']}\n"
+                    f"📦 <b>Product:</b> {result['icon']} {result['name']}\n"
+                    f"🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                    f"💰 <b>Charged:</b> ${result['total_price']:.2f}\n\n"
+                    f"{'─' * 34}\n\n"
+                    f"👨‍💼 <b>Delivery:</b> Manual by our team\n"
+                    f"⏱ <b>ETA:</b> Usually within 24 hours\n"
+                    f"🔔 <b>Notification:</b> You'll receive\n"
+                    f"a message when it's delivered.\n\n"
+                    f"💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n\n"
+                    f"<i>Our team is on it! 🚀</i>"
                 )
-            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+
+            # Build keyboard with optional delivery instruction button
+            pending_buttons = [
                 [InlineKeyboardButton(text="📜 Track Order", callback_data="orders_menu", style="primary"),
                  InlineKeyboardButton(text="🆘 Support", callback_data="support_menu", style="danger")],
-                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-            ])
+            ]
+            if has_instr:
+                pending_buttons.insert(0, [
+                    InlineKeyboardButton(text="📋 📖 Delivery Instructions", callback_data=f"delivery_instruction_{product_id}", style="primary")
+                ])
+            pending_buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")])
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=pending_buttons)
 
         await show(callback, text, parse_mode="HTML", reply_markup=reply_markup)
 

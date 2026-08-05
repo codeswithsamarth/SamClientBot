@@ -10,6 +10,7 @@ class AddProduct(StatesGroup):
     price = State()
     description = State()
     delivery_type = State()
+    delivery_instruction = State()
     preorder = State()
     bulk_pricing = State()
     accounts = State()
