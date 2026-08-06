@@ -125,7 +125,7 @@ def _build_user_dashboard(user) -> str:
         "</blockquote>\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📢 Stay Updated: @RainStore\n\n"
+        "📢 Stay Updated: @rainworlddd\n\n"
         "👇 Tap a button below to get started."
     )
 
