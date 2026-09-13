@@ -4,6 +4,7 @@ import asyncio
 import json
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta
+from html import escape as _esc
 from typing import Optional
 
 from aiogram import Router, F
@@ -164,7 +165,6 @@ def _format_timestamp(dt: datetime, relative: bool = False) -> str:
     return dt.strftime("%d %b %Y, %I:%M %p")
 
 
-# 🆕 Fetch product helper
 def _fetch_product(product_id: int):
     """Fetch a product by ID."""
     db = SessionLocal()
@@ -172,6 +172,41 @@ def _fetch_product(product_id: int):
         return db.query(Product).filter(Product.id == product_id).first()
     finally:
         db.close()
+
+
+def _format_delivered_account(acc_str: str, index: int = 1) -> str:
+    """
+    Parses and formats multi-part credential strings cleanly.
+    Handles 'email:password:link', 'email:password', or raw credential strings.
+    """
+    raw = acc_str.strip()
+    if not raw:
+        return ""
+
+    if ":" in raw:
+        parts = raw.split(":", 2)
+        if len(parts) == 3 and ("http://" in parts[2] or "https://" in parts[2]):
+            email = parts[0].strip()
+            password = parts[1].strip()
+            link = parts[2].strip()
+            return (
+                f"  <b>Item #{index}:</b>\n"
+                f"  📧 <b>Email:</b> <code>{_esc(email)}</code>\n"
+                f"  🔑 <b>Password:</b> <code>{_esc(password)}</code>\n"
+                f"  🔗 <b>Mail Reader Link:</b> <code>{_esc(link)}</code>\n"
+                f"  📋 <b>Full Combo:</b> <code>{_esc(raw)}</code>"
+            )
+        elif len(parts) == 2:
+            email = parts[0].strip()
+            password = parts[1].strip()
+            return (
+                f"  <b>Item #{index}:</b>\n"
+                f"  📧 <b>Email:</b> <code>{_esc(email)}</code>\n"
+                f"  🔑 <b>Password:</b> <code>{_esc(password)}</code>\n"
+                f"  📋 <b>Full Combo:</b> <code>{_esc(raw)}</code>"
+            )
+
+    return f"  {index}. <code>{_esc(raw)}</code>"
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -270,13 +305,12 @@ def _format_order(order: Order, detailed: bool = True) -> str:
 
     # Delivered accounts (if any and detailed mode)
     if detailed and getattr(order, "delivered_account", None) and order.delivered_account.strip():
-        accounts = order.delivered_account.strip().split("\n")
-        body += f"\n🔑 <b>Delivered Accounts:</b>\n"
-        for i, account in enumerate(accounts[:50], 1):  # Limit to 50
-            if account.strip():
-                body += f"   {i}. <code>{account.strip()[:30]}</code>\n"
+        accounts = [a.strip() for a in order.delivered_account.strip().split("\n") if a.strip()]
+        body += f"\n🔑 <b>Delivered Credentials:</b>\n\n"
+        formatted_list = [_format_delivered_account(acc, i) for i, acc in enumerate(accounts[:50], 1)]
+        body += "\n\n".join(formatted_list) + "\n"
         if len(accounts) > 50:
-            body += f"   <i>...and {len(accounts) - 50} more</i>\n"
+            body += f"\n   <i>...and {len(accounts) - 50} more</i>\n"
 
     # Dates
     if getattr(order, "created_at", None):
@@ -533,7 +567,7 @@ async def my_orders(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              ORDER DETAIL VIEW 🆕 (with Delivery Instructions)║
+# ║              ORDER DETAIL VIEW                              ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("order_detail_"))
@@ -631,7 +665,7 @@ async def order_detail(callback: CallbackQuery):
 
     text += f"\n{status_messages.get(order.status, '')}"
 
-    # 🆕 Check if product has delivery instructions
+    # Check if product has delivery instructions
     has_instruction = False
     product_id = getattr(order, "product_id", None)
     if product_id:
@@ -642,7 +676,7 @@ async def order_detail(callback: CallbackQuery):
     # Action buttons based on status
     action_buttons = []
 
-    # 🆕 Delivery Instructions button — shows for completed orders that have instructions
+    # Delivery Instructions button — shows for completed orders that have instructions
     if order.status == "completed" and has_instruction:
         action_buttons.append([
             InlineKeyboardButton(
@@ -732,7 +766,7 @@ async def order_detail(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║         DELIVERY INSTRUCTION BUTTON HANDLER (ORDERS) 🆕    ║
+# ║         DELIVERY INSTRUCTION BUTTON HANDLER (ORDERS)       ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("delivery_instruction_"))
@@ -822,7 +856,7 @@ async def order_receipt(callback: CallbackQuery):
     )
 
     if order.status == "completed" and order.delivered_account:
-        receipt += f"Delivered Accounts:\n{order.delivered_account[:200]}\n\n"
+        receipt += f"Delivered Accounts:\n{order.delivered_account}\n\n"
 
     receipt += (
         f"{'─' * 36}\n"
@@ -953,7 +987,8 @@ async def handle_order_rating(callback: CallbackQuery):
     await show(
         callback,
         (
-            f"{rating_emoji[rating]} <b>RATING SAVED</b>\n\n"            f"📦 <b>Order #{order_id}</b>\n\n"
+            f"{rating_emoji[rating]} <b>RATING SAVED</b>\n\n"
+            f"📦 <b>Order #{order_id}</b>\n\n"
             f"Your rating: {stars}\n"
             f"Rating: <b>{rating_labels[rating]}</b>\n\n"
             f"{_divider('─')}\n\n"

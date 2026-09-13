@@ -1,7 +1,10 @@
-# admin_product_manage.py
+# handlers/admin_product_manage.py — FULLY WORKING ADMIN PRODUCT MANAGEMENT
 
 import json
 import logging
+import asyncio
+from decimal import Decimal
+from html import escape as html_escape
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -12,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardButton
 )
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
 
 from config import ADMIN_IDS
 from database import SessionLocal
@@ -21,8 +25,6 @@ from handlers.products import _real_stock, _send_stock_channel_message
 
 router = Router()
 logger = logging.getLogger(__name__)
-
-print("✅ admin_product_manage imported")
 
 DELIVERY_TYPES = ["automatic", "manual", "hybrid"]
 DELIVERY_LABELS = {
@@ -37,8 +39,22 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def safe(text: str) -> str:
+    return html_escape(str(text or ""), quote=False)
+
+
 def _divider(char: str = "━", length: int = 30) -> str:
     return char * length
+
+
+async def _safe_edit_text(message: Message, text: str, reply_markup=None, parse_mode: str = "HTML"):
+    """Safely edit message text, ignoring Telegram 'message is not modified' errors."""
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return None
+        raise
 
 
 def _get_category_label(product) -> str:
@@ -57,9 +73,7 @@ def _get_category_label(product) -> str:
 
 
 def _build_stockctl_sync_text(product) -> str:
-    """Build the stockctl sync notification text from scratch (no dependencies on products.py internals)."""
-    from html import escape as _esc
-
+    """Build the stockctl sync notification text."""
     stock = _real_stock(product)
 
     status = "IN STOCK" if stock > 0 else "OUT OF STOCK"
@@ -78,26 +92,19 @@ def _build_stockctl_sync_text(product) -> str:
         "STOCK UPDATED",
         f"Product     {product.name}",
         f"Category    {_get_category_label(product)}",
-        f"Price       ${float(product.price):.2f}",
+        f"Price       ${float(product.price or 0):.2f}",
         f"Stock       {stock} Available",
         f"State       {status}",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "Inventory synchronized.",
         "root@Rain:~#",
     ]
-    return "<pre>" + _esc("\n".join(lines)) + "</pre>"
+    return "<pre>" + safe("\n".join(lines)) + "</pre>"
 
 
 async def _notify_stock_change(bot, pid: int):
-    """
-    Fetch product by ID, build a stockctl sync notification,
-    and send it to STOCK_GROUP_ID.
-    """
-    db = SessionLocal()
-    try:
-        product = db.query(Product).filter(Product.id == pid).first()
-    finally:
-        db.close()
+    """Fetch product by ID, build stockctl sync notification, and send to channel."""
+    product = await asyncio.to_thread(_load_product, pid)
 
     if not product:
         logger.warning("_notify_stock_change: Product %s not found", pid)
@@ -105,6 +112,18 @@ async def _notify_stock_change(bot, pid: int):
 
     text = _build_stockctl_sync_text(product)
     await _send_stock_channel_message(bot, text)
+
+
+def _load_product(pid: int):
+    """Fetch a product in a worker thread; PyMySQL is synchronous."""
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == pid).first()
+        if product is not None:
+            db.expunge(product)
+        return product
+    finally:
+        db.close()
 
 
 def _parse_bulk_pricing(raw_text: str) -> dict | None:
@@ -222,22 +241,18 @@ def _format_bulk_pricing_plain(bulk_pricing: str | None) -> str:
 
 
 # ==================================================
-# HELPER – refresh the manage panel
+# HELPER – REFRESH MANAGE PANEL
 # ==================================================
 
 async def _refresh_manage_panel(callback: CallbackQuery, pid: int):
-    db = SessionLocal()
-    try:
-        product = db.query(Product).filter(Product.id == pid).first()
-    finally:
-        db.close()
+    product = await asyncio.to_thread(_load_product, pid)
 
     if not product:
         await callback.answer("❌ Product not found.")
         return
 
     text, markup = _build_product_panel(product)
-    await callback.message.edit_text(text, reply_markup=markup)
+    await _safe_edit_text(callback.message, text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
 
 
@@ -253,10 +268,10 @@ def _build_product_panel(product: Product):
 🆔 <b>ID:</b> {product.id}
 
 📦 <b>Product:</b>
-{product.icon or '📦'} {product.name}
+{safe(product.icon or '📦')} {safe(product.name)}
 
 💰 <b>Base Price:</b>
-${float(product.price):.2f}
+${float(product.price or 0):.2f}
 
 📊 <b>Stock:</b>
 {product.stock}
@@ -271,10 +286,23 @@ ${float(product.price):.2f}
 {"🟢 Enabled" if product.preorder else "🔴 Disabled"}
 
 🏷 <b>Category:</b>
-{product.category}
+{safe(product.category or 'General')}
 
 <b>Status:</b>
 {"🟢 Enabled" if product.is_active else "🔴 Disabled"}
+"""
+
+    # Add Provider / Reseller Details if configured
+    reseller_id = getattr(product, "reseller_service_id", None) or getattr(product, "provider_product_id", None)
+    reseller_name = getattr(product, "reseller_name", None)
+    reseller_cost = getattr(product, "reseller_cost", None)
+
+    if reseller_id or reseller_name:
+        cost_display = f"${float(reseller_cost):.2f}" if reseller_cost is not None else "N/A"
+        text += f"""
+🏪 <b>Reseller Provider:</b> {safe(reseller_name or 'Configured Provider')}
+🆔 <b>Provider Product ID:</b> <code>{safe(str(reseller_id))}</code>
+💸 <b>Wholesale Cost:</b> {cost_display}
 """
 
     text += f"\n{_divider('─')}\n"
@@ -295,7 +323,7 @@ ${float(product.price):.2f}
 
 📝 <b>Description:</b>
 
-{product.description or "No description"}
+{safe(product.description or "No description")}
 """
 
     has_accounts = bool(product.file_content and product.file_content.strip())
@@ -379,17 +407,13 @@ ${float(product.price):.2f}
 
 
 # ==================================================
-# TEST
+# COMMANDS & HANDLERS
 # ==================================================
 
 @router.message(Command("testadmin"))
 async def test_admin(message: Message):
     await message.answer("✅ Admin router working")
 
-
-# ==================================================
-# PRODUCT PANEL
-# ==================================================
 
 @router.callback_query(F.data.startswith("manage_"))
 async def manage_product(callback: CallbackQuery):
@@ -399,23 +423,14 @@ async def manage_product(callback: CallbackQuery):
 
     product_id = int(callback.data.split("_")[1])
 
-    db = SessionLocal()
-    try:
-        product = db.query(Product).filter(Product.id == product_id).first()
-    finally:
-        db.close()
+    product = await asyncio.to_thread(_load_product, product_id)
 
     if not product:
         await callback.answer("❌ Product not found.")
         return
 
     text, markup = _build_product_panel(product)
-
-    if callback.message.text is not None:
-        await callback.message.edit_text(text, reply_markup=markup)
-    else:
-        await callback.message.answer(text, reply_markup=markup)
-
+    await _safe_edit_text(callback.message, text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
 
 
@@ -479,7 +494,6 @@ async def save_accounts(message: Message, state: FSMContext):
 
     await state.clear()
 
-    # 🆕 NOTIFY STOCK CHANNEL
     try:
         await _notify_stock_change(message.bot, pid)
     except Exception:
@@ -512,11 +526,7 @@ async def edit_accounts(callback: CallbackQuery, state: FSMContext):
 
     pid = int(callback.data.split("_")[2])
 
-    db = SessionLocal()
-    try:
-        product = db.query(Product).filter(Product.id == pid).first()
-    finally:
-        db.close()
+    product = await asyncio.to_thread(_load_product, pid)
 
     if not product:
         await callback.answer("❌ Product not found.")
@@ -524,13 +534,12 @@ async def edit_accounts(callback: CallbackQuery, state: FSMContext):
 
     accounts = product.file_content or ""
     line_count = len([l for l in accounts.splitlines() if l.strip()])
-
     preview = accounts[:500] + ("..." if len(accounts) > 500 else "")
 
-    text = f"📋 **Accounts for** {product.name}\n\n"
-    text += f"📊 Total accounts: **{line_count}**\n"
-    text += f"📦 Current stock: **{product.stock}**\n\n"
-    text += f"```\n{preview}\n```"
+    text = f"📋 <b>Accounts for {safe(product.name)}</b>\n\n"
+    text += f"📊 Total accounts: <b>{line_count}</b>\n"
+    text += f"📦 Current stock: <b>{product.stock}</b>\n\n"
+    text += f"<code>{safe(preview)}</code>"
 
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -561,7 +570,7 @@ async def edit_accounts(callback: CallbackQuery, state: FSMContext):
         ]
     )
 
-    await callback.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    await _safe_edit_text(callback.message, text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
 
 
@@ -576,12 +585,13 @@ async def replace_accounts_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(EditAccounts.replace_accounts)
 
     await callback.message.answer(
-        "📝 Send the **new** account list.\n\n"
-        "This will **replace** all existing accounts.\n"
+        "📝 Send the <b>new</b> account list.\n\n"
+        "This will <b>replace</b> all existing accounts.\n"
         "One account per line.\n\n"
         "Example:\n"
         "email1@gmail.com:pass1\n"
-        "email2@gmail.com:pass2"
+        "email2@gmail.com:pass2",
+        parse_mode="HTML"
     )
     await callback.answer()
 
@@ -614,7 +624,6 @@ async def replace_accounts_save(message: Message, state: FSMContext):
 
     await state.clear()
 
-    # 🆕 NOTIFY STOCK CHANNEL
     try:
         await _notify_stock_change(message.bot, pid)
     except Exception:
@@ -657,7 +666,6 @@ async def clear_accounts(callback: CallbackQuery):
     finally:
         db.close()
 
-    # 🆕 NOTIFY STOCK CHANNEL
     try:
         await _notify_stock_change(callback.bot, pid)
     except Exception:
@@ -668,7 +676,7 @@ async def clear_accounts(callback: CallbackQuery):
 
 
 # ==================================================
-# ENABLE / DISABLE
+# ENABLE / DISABLE & TOGGLES
 # ==================================================
 
 @router.callback_query(
@@ -693,10 +701,6 @@ async def toggle_product(callback: CallbackQuery):
 
     await _refresh_manage_panel(callback, pid)
 
-
-# ==================================================
-# DELIVERY TYPE
-# ==================================================
 
 @router.callback_query(F.data.startswith("cycle_delivery_"))
 async def cycle_delivery_type(callback: CallbackQuery):
@@ -729,10 +733,6 @@ async def cycle_delivery_type(callback: CallbackQuery):
     await _refresh_manage_panel(callback, pid)
 
 
-# ==================================================
-# PREORDER TOGGLE
-# ==================================================
-
 @router.callback_query(F.data.startswith("toggle_preorder_"))
 async def toggle_preorder(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -754,14 +754,12 @@ async def toggle_preorder(callback: CallbackQuery):
     finally:
         db.close()
 
-    await callback.answer(
-        "📦 Preorder enabled" if new_state else "📦 Preorder disabled"
-    )
+    await callback.answer("📦 Preorder enabled" if new_state else "📦 Preorder disabled")
     await _refresh_manage_panel(callback, pid)
 
 
 # ==================================================
-# BULK PRICING — EDIT
+# BULK PRICING
 # ==================================================
 
 @router.callback_query(F.data.startswith("edit_bulk_"))
@@ -791,10 +789,10 @@ async def edit_bulk_pricing(callback: CallbackQuery, state: FSMContext):
         "╔══════════════════════════════╗\n"
         "║  📦 EDIT BULK PRICING       ║\n"
         "╚══════════════════════════════╝\n\n"
-        f"📦 <b>Product:</b> #{pid} — {product.name}\n\n"
+        f"📦 <b>Product:</b> #{pid} — {safe(product.name)}\n\n"
         f"{_divider('─')}\n\n"
         f"<b>Current Bulk Pricing:</b>\n"
-        f"<code>{current}</code>\n\n"
+        f"<code>{safe(current)}</code>\n\n"
         f"{_divider('═')}\n\n"
         f"📝 <b>Send new tiers</b> (one per line):\n\n"
         f"<code>1-10=5.00</code>\n"
@@ -808,7 +806,7 @@ async def edit_bulk_pricing(callback: CallbackQuery, state: FSMContext):
         f"delete bulk pricing (flat pricing)"
     )
 
-    await callback.message.answer(text)
+    await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
 
@@ -833,17 +831,13 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
             "All quantities will be charged at the base price."
         )
         await state.clear()
-        await message.answer(confirm, reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📋 Back to Product",
-                        callback_data=f"manage_{pid}",
-                        style="primary"
-                    )
-                ]
-            ]
-        ))
+        await message.answer(
+            confirm,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="📋 Back to Product", callback_data=f"manage_{pid}")]]
+            )
+        )
     else:
         bulk_data = _parse_bulk_pricing(raw)
 
@@ -855,7 +849,8 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
                 "<code>1-10=5.00</code>\n"
                 "<code>11-50=4.00</code>\n"
                 "<code>51+=3.00</code>\n\n"
-                "OR send <b>skip</b> to remove."
+                "OR send <b>skip</b> to remove.",
+                parse_mode="HTML"
             )
             return
 
@@ -873,17 +868,13 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
             "the best price for their quantity!"
         )
 
-        await message.answer(confirm, reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📋 Back to Product",
-                        callback_data=f"manage_{pid}",
-                        style="primary"
-                    )
-                ]
-            ]
-        ))
+        await message.answer(
+            confirm,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="📋 Back to Product", callback_data=f"manage_{pid}")]]
+            )
+        )
 
     db = SessionLocal()
     try:
@@ -896,7 +887,7 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
 
 
 # ==================================================
-# HELP COMMANDS
+# QUICK PROMPTS & COMMAND EDITORS
 # ==================================================
 
 @router.callback_query(F.data.startswith("edit_price_"))
@@ -905,7 +896,7 @@ async def edit_price(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[2]
-    await callback.message.answer(f"Send:\n/setprice {pid} 9.99")
+    await callback.message.answer(f"Send:\n<code>/setprice {pid} 9.99</code>", parse_mode="HTML")
     await callback.answer()
 
 
@@ -915,7 +906,7 @@ async def edit_stock(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[2]
-    await callback.message.answer(f"Send:\n/setstock {pid} 100")
+    await callback.message.answer(f"Send:\n<code>/setstock {pid} 100</code>", parse_mode="HTML")
     await callback.answer()
 
 
@@ -926,8 +917,9 @@ async def edit_threshold(callback: CallbackQuery):
         return
     pid = callback.data.split("_")[2]
     await callback.message.answer(
-        f"Send:\n/setthreshold {pid} 3\n\n"
-        "You'll get a Telegram alert whenever stock drops to or below this number."
+        f"Send:\n<code>/setthreshold {pid} 3</code>\n\n"
+        "You'll get a Telegram alert whenever stock drops to or below this number.",
+        parse_mode="HTML"
     )
     await callback.answer()
 
@@ -938,12 +930,12 @@ async def edit_desc(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[1]
-    await callback.message.answer(f"Send:\n/setdesc {pid} New Description")
+    await callback.message.answer(f"Send:\n<code>/setdesc {pid} New Description</code>", parse_mode="HTML")
     await callback.answer()
 
 
 # ==================================================
-# SET PRICE
+# SET PRICE / SET STOCK / SET THRESHOLD / SET DESC
 # ==================================================
 
 @router.message(Command("setprice"))
@@ -954,7 +946,7 @@ async def set_price(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("❌ Usage: /setprice <product_id> <price>\nExample: /setprice 5 9.99")
+        await message.answer("❌ Usage: <code>/setprice &lt;product_id&gt; &lt;price&gt;</code>\nExample: <code>/setprice 5 9.99</code>", parse_mode="HTML")
         return
     _, pid_raw, price_raw = parts
     if not pid_raw.isdigit():
@@ -974,16 +966,12 @@ async def set_price(message: Message):
         if not product:
             await message.answer("❌ Product not found.")
             return
-        product.price = price
+        product.price = Decimal(str(price))
         db.commit()
-        await message.answer(f"✅ Price updated to ${price:.2f}.")
+        await message.answer(f"✅ Price updated to <b>${price:.2f}</b>.", parse_mode="HTML")
     finally:
         db.close()
 
-
-# ==================================================
-# SET STOCK
-# ==================================================
 
 @router.message(Command("setstock"))
 async def set_stock(message: Message):
@@ -993,7 +981,7 @@ async def set_stock(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("❌ Usage: /setstock <product_id> <stock>\nExample: /setstock 5 100")
+        await message.answer("❌ Usage: <code>/setstock &lt;product_id&gt; &lt;stock&gt;</code>\nExample: <code>/setstock 5 100</code>", parse_mode="HTML")
         return
     _, pid_raw, stock_raw = parts
     if not pid_raw.isdigit():
@@ -1015,12 +1003,11 @@ async def set_stock(message: Message):
             await message.answer("❌ Product not found.")
             return
         delivery_type = (product.delivery_type or "automatic").lower()
-        if delivery_type == "automatic":
+        if delivery_type == "automatic" and not getattr(product, "reseller_service_id", None):
             await message.answer(
-                "ℹ️ This product delivers automatically from the account list, "
-                "so stock is derived from how many accounts are loaded "
-                "(use ➕ Add Accounts to change it). Setting it manually here "
-                "won't survive the next sale or account upload."
+                "ℹ️ This product delivers automatically from loaded accounts, "
+                "so stock is derived from the account list. Setting manual stock "
+                "won't persist across automated sales or uploads."
             )
         product.stock = stock
         db.commit()
@@ -1028,18 +1015,13 @@ async def set_stock(message: Message):
     finally:
         db.close()
 
-    # 🆕 NOTIFY STOCK CHANNEL
     try:
         await _notify_stock_change(message.bot, pid)
     except Exception:
         logger.exception("Failed to send stock notification after /setstock")
 
-    await message.answer(f"✅ Stock updated to {stock}.")
+    await message.answer(f"✅ Stock updated to <b>{stock}</b>.", parse_mode="HTML")
 
-
-# ==================================================
-# SET LOW STOCK THRESHOLD
-# ==================================================
 
 @router.message(Command("setthreshold"))
 async def set_threshold(message: Message):
@@ -1049,7 +1031,7 @@ async def set_threshold(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("❌ Usage: /setthreshold <product_id> <threshold>\nExample: /setthreshold 5 3")
+        await message.answer("❌ Usage: <code>/setthreshold &lt;product_id&gt; &lt;threshold&gt;</code>\nExample: <code>/setthreshold 5 3</code>", parse_mode="HTML")
         return
     _, pid_raw, threshold_raw = parts
     if not pid_raw.isdigit():
@@ -1071,14 +1053,10 @@ async def set_threshold(message: Message):
             return
         product.low_stock_threshold = threshold
         db.commit()
-        await message.answer(f"✅ Low stock alert threshold set to {threshold}.")
+        await message.answer(f"✅ Low stock alert threshold set to <b>{threshold}</b>.", parse_mode="HTML")
     finally:
         db.close()
 
-
-# ==================================================
-# SET DESCRIPTION
-# ==================================================
 
 @router.message(Command("setdesc"))
 async def set_desc(message: Message):
@@ -1088,7 +1066,7 @@ async def set_desc(message: Message):
         return
     parts = message.text.split(maxsplit=2)
     if len(parts) != 3:
-        await message.answer("❌ Usage: /setdesc <product_id> <description>")
+        await message.answer("❌ Usage: <code>/setdesc &lt;product_id&gt; &lt;description&gt;</code>", parse_mode="HTML")
         return
     _, pid_raw, desc = parts
     if not pid_raw.isdigit():
@@ -1125,7 +1103,9 @@ async def delete_product(callback: CallbackQuery):
             db.commit()
     finally:
         db.close()
-    await callback.message.edit_text(
+
+    await _safe_edit_text(
+        callback.message,
         "✅ Product deleted.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1136,6 +1116,7 @@ async def delete_product(callback: CallbackQuery):
                     )
                 ]
             ]
-        )
+        ),
+        parse_mode="HTML"
     )
     await callback.answer()

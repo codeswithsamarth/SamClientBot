@@ -1,19 +1,35 @@
-"""
-models/product.py
+# models/product.py
 
-Product model — SQLAlchemy 2.x declarative style. Columns are
-unchanged from the previous version (verified against
-migrate_add_columns.py, which is where delivery_type, preorder, and
-low_stock_threshold were added to an already-live table).
+"""
+Product model — SQLAlchemy 2.x declarative style.
+
+Supports:
+- Own products
+- Reseller/provider-linked products
 """
 
+from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from sqlalchemy import Boolean, Integer, Numeric, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
+
+if TYPE_CHECKING:
+    from models.provider import Provider
 
 
 class Product(Base):
@@ -31,44 +47,48 @@ class Product(Base):
     )
 
     icon: Mapped[Optional[str]] = mapped_column(
-        String(20),
+        String(50),
         default="📦",
     )
 
-    description: Mapped[Optional[str]] = mapped_column(Text)
+    description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
 
-    category: Mapped[Optional[str]] = mapped_column(String(255))
+    category: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        default="General",
+        nullable=True,
+    )
 
     # Optional delivery instructions shown to buyer AFTER purchase.
-    # Appears as a clickable button in the purchase confirmation message
-    # and in the order detail view.
-    # NULL means no instructions for this product.
     delivery_instruction: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
         default=None,
     )
 
-    # DECIMAL(20, 8) — always compare/multiply as Decimal, never float.
+    # DECIMAL(20, 8) — always compare/multiply as Decimal.
     price: Mapped[Decimal] = mapped_column(
         Numeric(20, 8),
         nullable=False,
-        default=Decimal("0"),
+        default=Decimal("0.00000000"),
     )
 
-    # Manual-fulfillment / hybrid stock counter. For "automatic"
-    # delivery, real availability is len(file_content accounts), not
-    # this column — see _accounts_count()/_real_stock() in
-    # handlers/products.py.
+    # Manual/local stock counter.
+    # For reseller products this is NOT the source of truth.
     stock: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
     )
 
-    # Newline-separated pool of account/key strings consumed on
-    # automatic/hybrid delivery.
-    file_content: Mapped[Optional[str]] = mapped_column(Text)
+    # Newline-separated pool of accounts/keys for own products.
+    file_content: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
 
     is_active: Mapped[bool] = mapped_column(
         Boolean,
@@ -76,10 +96,7 @@ class Product(Base):
         default=True,
     )
 
-    # "automatic" -> deliver instantly from file_content accounts
-    # "manual"    -> admin fulfills each order by hand from the Orders panel
-    # "hybrid"    -> auto-deliver if an account is available, else queue
-    #                for manual fulfillment
+    # "automatic", "manual", or "hybrid"
     delivery_type: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -87,8 +104,7 @@ class Product(Base):
         server_default="automatic",
     )
 
-    # If True, customers can still order at 0 stock; the order is
-    # queued as a preorder instead of being blocked.
+    # If True, customers can still order at 0 stock.
     preorder: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -96,7 +112,7 @@ class Product(Base):
         server_default="0",
     )
 
-    # Admins get a Telegram alert once stock drops to/below this number.
+    # Admin alert threshold.
     low_stock_threshold: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -104,14 +120,104 @@ class Product(Base):
         server_default="3",
     )
 
-    # JSON string storing tiered/bulk pricing rules.
-    # Format: {"1": {"min": 1, "max": 10, "price": 5.00}, "11": {"min": 11, "max": null, "price": 3.00}}
-    # NULL means flat pricing only (base price applies to all quantities).
-    bulk_pricing: Mapped[Optional[str]] = mapped_column(
-        Text,
+    # JSON storage for tiered/bulk pricing rules.
+    bulk_pricing: Mapped[Optional[dict]] = mapped_column(
+        JSON,
         nullable=True,
         default=None,
     )
 
+    # ============================================================
+    # MULTI-PROVIDER & RESELLER FIELDS
+    # ============================================================
+
+    # Product source: "own" or "reseller"
+    source: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="own",
+        server_default="own",
+    )
+
+    # Direct Foreign Key linking to providers table
+    provider_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("providers.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
+    # Reseller service/product ID on external API
+    reseller_service_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+    )
+
+    # Original price charged by the reseller
+    reseller_cost: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 8),
+        nullable=True,
+        default=None,
+    )
+
+    # Name/identifier of the reseller configuration for backward compatibility
+    reseller_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    # ORM Relationship (string reference avoids duplicate table declarations)
+    provider: Mapped[Optional["Provider"]] = relationship(
+        "Provider", back_populates="products"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_id", "reseller_service_id", name="uq_provider_reseller_service"
+        ),
+    )
+
     def __repr__(self) -> str:
-        return f"<Product id={self.id} name={self.name!r} stock={self.stock}>"
+        return (
+            f"<Product "
+            f"id={self.id} "
+            f"name={self.name!r} "
+            f"source={self.source!r} "
+            f"provider_id={self.provider_id} "
+            f"stock={self.stock}>"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize product model to dictionary safely."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "icon": self.icon,
+            "description": self.description,
+            "category": self.category,
+            "delivery_instruction": self.delivery_instruction,
+            "price": str(self.price) if self.price is not None else "0.00000000",
+            "stock": self.stock,
+            "is_active": self.is_active,
+            "delivery_type": self.delivery_type,
+            "preorder": self.preorder,
+            "low_stock_threshold": self.low_stock_threshold,
+            "bulk_pricing": self.bulk_pricing,
+            "source": self.source,
+            "provider_id": self.provider_id,
+            "reseller_service_id": self.reseller_service_id,
+            "reseller_cost": str(self.reseller_cost) if self.reseller_cost is not None else None,
+            "reseller_name": self.reseller_name,
+            "provider": self.provider.to_dict() if self.provider and hasattr(self.provider, "to_dict") else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }

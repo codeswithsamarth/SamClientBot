@@ -5,7 +5,7 @@ import uuid
 import logging
 import asyncio
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -121,13 +121,32 @@ def _border_box(title: str, emoji: str = "💰") -> str:
     )
 
 
-def _format_amount(amount: float, network: str) -> str:
-    if network == "UPI":
-        return f"₹{amount:,.2f} INR"
-    elif network == "BINANCE":
-        return f"${amount:,.2f} USDT (equivalent)"
-    else:
-        return f"${amount:,.2f} USDT"
+def _format_value(value, places: str) -> str:
+    """Format a Decimal value without exposing accounting-only precision."""
+    try:
+        rounded = Decimal(str(value or 0)).quantize(Decimal(places), rounding=ROUND_HALF_UP)
+        return format(rounded, "f").rstrip("0").rstrip(".") or "0"
+    except Exception:
+        return "0"
+
+
+def _format_usdt(value) -> str:
+    return f"${_format_value(value, '0.001')} USDT"
+
+
+def _format_inr(value) -> str:
+    return f"₹{_format_value(value, '0.01')} INR"
+
+
+def _format_amount(amount, network: str) -> str:
+    """Compatibility formatter for payment-start screens.
+
+    Completed UPI history uses both INR and USDT separately; this helper is
+    for the requested amount shown before a payment is verified.
+    """
+    if (network or "").upper() == "UPI":
+        return _format_inr(amount)
+    return _format_usdt(amount)
 
 
 def _format_timestamp() -> str:
@@ -382,7 +401,6 @@ def _build_deposit_card(deposit, index: int) -> str:
     status_emoji = _status_emoji(deposit.status)
     status_label = _status_label(deposit.status)
 
-    amount_str = _format_amount(deposit.amount, deposit.network or "")
     created_str = _format_dt(deposit.created_at if hasattr(deposit, 'created_at') else None)
 
     tx_display = "N/A"
@@ -394,13 +412,27 @@ def _build_deposit_card(deposit, index: int) -> str:
         else:
             tx_display = deposit.tx_hash
 
+    amount_lines = []
+    if (deposit.network or "").upper() == "UPI" and deposit.status == "completed":
+        # New records retain both values. Older UPI deposits only have the
+        # converted USDT amount, so do not incorrectly label it as INR.
+        if deposit.inr_amount is not None:
+            amount_lines.append(f"├─ 🇮🇳 <b>Paid:</b> {_format_inr(deposit.inr_amount)}")
+        amount_lines.append(f"├─ 💰 <b>Credited:</b> {_format_usdt(deposit.received_amount or deposit.amount)}")
+        if deposit.conversion_rate is not None:
+            amount_lines.append(f"├─ 💱 <b>Rate:</b> ₹{_format_value(deposit.conversion_rate, '0.001')} / USDT")
+    elif (deposit.network or "").upper() == "UPI":
+        amount_lines.append(f"├─ 🇮🇳 <b>Expected:</b> {_format_inr(deposit.amount)}")
+    else:
+        amount_lines.append(f"├─ 💰 <b>Amount:</b> {_format_usdt(deposit.received_amount or deposit.amount)}")
+
     card = (
         f"{status_emoji} <b>Deposit #{deposit.id}</b>\n"
         f"├─ {icon} <b>Network:</b> {network_info['label']}\n"
-        f"├─ 💰 <b>Amount:</b> {amount_str}\n"
-        f"├─ 🔑 <b>Ref:</b> <code>{tx_display}</code>\n"
-        f"├─ 📅 <b>Date:</b> {created_str}\n"
-        f"└─ 📊 <b>Status:</b> {status_label}\n"
+        + "\n".join(amount_lines) + "\n"
+        + f"├─ 🔑 <b>Ref:</b> <code>{tx_display}</code>\n"
+        + f"├─ 📅 <b>Date:</b> {created_str}\n"
+        + f"└─ 📊 <b>Status:</b> {status_label}\n"
     )
     return card
 
@@ -853,45 +885,45 @@ async def process_promo_code(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.in_(NETWORK_CALLBACKS.keys()))
 async def select_network(callback: CallbackQuery, state: FSMContext):
-    """Handle network selection."""
+    """Create a deposit immediately; the verified reference supplies the amount."""
     await callback.answer()
 
     network = NETWORK_CALLBACKS[callback.data]
     network_config = _get_network_info(network)
+    telegram_id = callback.from_user.id
 
-    await state.update_data(network=network)
-    await state.set_state(DepositState.waiting_amount)
+    try:
+        # 0 is the existing database-safe marker for an amount that will be
+        # determined from the submitted UTR/TXID.
+        deposit_id = await asyncio.to_thread(_create_deposit, telegram_id, 0.0, network)
+    except Exception:
+        logger.exception("Failed to create deposit")
+        await callback.message.answer("❌ Failed to create deposit. Please try again.")
+        return
+
+    await state.update_data(network=network, deposit_id=deposit_id)
+
+    if network == "UPI":
+        payment_details = f"<blockquote><code>{getattr(config, 'UPI_ID', '')}</code></blockquote>"
+        reference = "UTR / Transaction ID"
+    elif network == BINANCE_PAY_NETWORK:
+        payment_details = f"<blockquote><code>{BINANCE_PAY_ID}</code></blockquote>"
+        reference = "Binance Pay Order ID"
+    else:
+        payment_details = f"<blockquote><code>{NETWORK_ADDRESSES.get(network, '')}</code></blockquote>"
+        reference = "Transaction Hash (TXID)"
 
     text = (
-        f"{network_config['icon']} <b>ENTER AMOUNT</b>\n\n"
-        f"<b>Method:</b> {network_config['icon']} {network_config['label']}\n"
-        f"<b>Network:</b> {network_config['description']}\n"
-        f"<b>Currency:</b> {network_config['currency']}\n\n"
-        f"{_divider('─', 28)}\n\n"
-        f"💵 <b>Please enter the amount you want to deposit:</b>\n\n"
-        f"<i>Send a number only (e.g. 10 or 25.50)</i>"
+        f"{network_config['icon']} <b>DEPOSIT CREATED</b>\n\n"
+        f"🆔 <b>Deposit ID:</b> <code>#{deposit_id}</code>\n"
+        f"📡 <b>Network:</b> {network_config['label']}\n"
+        f"📊 <b>Status:</b> ⏳ Awaiting Payment\n\n"
+        f"{payment_details}\n\n"
+        f"After payment, send your <b>{reference}</b>.\n"
+        "<i>The amount will be fetched automatically from the payment reference.</i>"
     )
-
-    await show(
-        callback,
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="❌ Cancel",
-                        callback_data="deposit_start",
-                    ),
-                    InlineKeyboardButton(
-                        text="🏠 Main Menu",
-                        callback_data="main_menu",
-                    ),
-                ],
-            ]
-        ),
-        state=state,
-    )
+    await show(callback, text, parse_mode="HTML", reply_markup=_cancel_kb(), state=state)
+    await state.set_state(DepositState.waiting_txid)
 
 
 # ╔══════════════════════════════════════════════════════════════╗

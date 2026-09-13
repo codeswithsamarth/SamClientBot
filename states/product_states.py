@@ -1,9 +1,12 @@
-# states/product_states.py
-
 from aiogram.fsm.state import State, StatesGroup
 
 
 class AddProduct(StatesGroup):
+
+    # First selection
+    source = State()
+
+    # Own product flow
     name = State()
     icon = State()
     category = State()
@@ -14,6 +17,12 @@ class AddProduct(StatesGroup):
     preorder = State()
     bulk_pricing = State()
     accounts = State()
+
+    # Reseller flow
+    reseller_select = State()
+    reseller_product = State()
+    reseller_price = State()
+
 
 
 class EditProduct(StatesGroup):
@@ -45,4 +54,4 @@ class EditAccounts(StatesGroup):
 class EditBulkPricing(StatesGroup):
     select_product = State()
     pricing = State()
-    waiting_input = State()       # ← ADD THIS
+    waiting_input = State()

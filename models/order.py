@@ -1,12 +1,9 @@
 """
 models/order.py
 
-Order model — matches the `orders` table exactly, including the
-columns added by migrate_add_columns.py (quantity, delivery_type,
-is_preorder).
+Order model — SQLAlchemy 2.x declarative style.
 
-Written in SQLAlchemy 2.x declarative style (Mapped / mapped_column)
-instead of the legacy Column(...) style, per project convention.
+Stores both normal/local orders and reseller/API fulfilled orders.
 """
 
 from datetime import datetime
@@ -17,13 +14,14 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    ForeignKey,
     Integer,
     Numeric,
     String,
     Text,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
 
@@ -54,8 +52,7 @@ class Order(Base):
         nullable=False,
     )
 
-    # DECIMAL(20, 8) — never Float. Every read of this column comes
-    # back as a Python Decimal; never mix it with float in arithmetic.
+    # DECIMAL(20, 8) — never Float.
     amount: Mapped[Decimal] = mapped_column(
         Numeric(20, 8),
         nullable=False,
@@ -69,9 +66,7 @@ class Order(Base):
         server_default="1",
     )
 
-    # "automatic" | "manual" | "hybrid" — mirrors Product.delivery_type
-    # at the time of purchase, so a later change to the product doesn't
-    # rewrite the history of how this specific order was fulfilled.
+    # "automatic" | "manual" | "hybrid"
     delivery_type: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -86,7 +81,7 @@ class Order(Base):
         server_default="0",
     )
 
-    # "completed" | "pending_manual" | "preorder" | "refunded"
+    # "completed" | "pending_manual" | "processing" | "preorder" | "refunded"
     status: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
@@ -101,10 +96,72 @@ class Order(Base):
         server_default="0",
     )
 
+    # Locally delivered account/code.
     delivered_account: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
     )
+
+    # For a manual reseller API order, this is the reseller's end customer.
+    # The separate DELIVERY_BOT_TOKEN bot receives the completed delivery.
+    # NULL means deliver using the normal store-bot buyer ID.
+    delivery_telegram_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+    )
+
+    # ============================================================
+    # RESELLER ORDER INFORMATION
+    # ============================================================
+
+    # ID of the reseller configuration/provider used for this order.
+    # Foreign key referencing providers.id
+    #
+    # Example:
+    # reseller_id = 1
+    #
+    # NULL means this was a normal/local product order.
+    reseller_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("providers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # The reseller's product/service ID.
+    #
+    # Example:
+    # service_1784565602
+    #
+    # This is the ID sent to POST /api/v1/order or provider purchase endpoint
+    reseller_service_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+
+    # Order ID returned by the reseller API after purchasing.
+    #
+    # Example:
+    # API_ABC123XYZ
+    #
+    # NULL until the reseller purchase succeeds.
+    reseller_order_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+
+    # Relationship to Provider model
+    provider: Mapped[Optional["Provider"]] = relationship(
+        "Provider",
+        lazy="selectin",
+    )
+
+    # ============================================================
+    # TIMESTAMP
+    # ============================================================
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -114,7 +171,13 @@ class Order(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<Order id={self.id} telegram_id={self.telegram_id} "
-            f"product_id={self.product_id} qty={self.quantity} "
+            f"<Order "
+            f"id={self.id} "
+            f"telegram_id={self.telegram_id} "
+            f"product_id={self.product_id} "
+            f"qty={self.quantity} "
+            f"reseller_id={self.reseller_id} "
+            f"reseller_service_id={self.reseller_service_id!r} "
+            f"reseller_order_id={self.reseller_order_id!r} "
             f"status={self.status!r}>"
         )

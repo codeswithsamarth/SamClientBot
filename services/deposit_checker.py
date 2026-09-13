@@ -1,11 +1,47 @@
+# services/deposit_checker.py
+
 """
 services/deposit_checker.py
 
-DEPOSIT CHECKER - MULTI-COIN + PROGRESSIVE CONFIRMATIONS
+HYBRID CRYPTO DEPOSIT CHECKER
 
-Supports: USDT, BUSD, USDC on BEP20 & Polygon
-Max wait: ~60 seconds for any legitimate deposit
-Never permanently fails a deposit due to slow confirmations
+Crypto:
+    RPC -> blockchain verification
+    Binance -> Binance-side deposit verification
+
+Supported:
+    USDT
+    BUSD
+    USDC
+
+Networks:
+    BSC / BEP20
+    Polygon
+
+RPC verifies:
+    - transaction exists
+    - transaction succeeded
+    - token contract
+    - Transfer event
+    - sender
+    - recipient
+    - amount
+    - block number
+    - confirmations
+
+Binance verifies:
+    - txId
+    - coin
+    - network
+    - destination address
+    - amount
+    - status
+
+UPI:
+    Existing IMAP verification
+
+Binance Pay:
+    Existing Binance Pay verification
 """
 
 from __future__ import annotations
@@ -15,20 +51,23 @@ import email
 import hashlib
 import hmac
 import imaplib
-import json
 import logging
 import re
 import time as time_module
+
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.header import decode_header
 from typing import Optional, Union
 
 import requests
 
 from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
+from binance.exceptions import BinanceAPIException
+
+from web3 import Web3
+from web3.exceptions import TransactionNotFound
 
 from database import SessionLocal
 from models.deposit import Deposit
@@ -36,144 +75,176 @@ from models.user import User
 
 import config
 
+
 logger = logging.getLogger(__name__)
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                    CONFIGURATION                            ║
-# ╚══════════════════════════════════════════════════════════════╝
+
+# ================================================================
+# CONFIGURATION
+# ================================================================
 
 BINANCE_API_KEY = getattr(config, "BINANCE_API_KEY", "")
 BINANCE_API_SECRET = getattr(config, "BINANCE_API_SECRET", "")
-NETWORK_MAP = getattr(config, "BINANCE_NETWORK_MAP", {})
 
-DEPOSIT_COINS = getattr(config, "BINANCE_DEPOSIT_COINS", ["USDT", "BUSD", "USDC"])
+DEPOSIT_COINS = getattr(
+    config,
+    "BINANCE_DEPOSIT_COINS",
+    ["USDT", "BUSD", "USDC"],
+)
 
 try:
-    BINANCE_LOOKBACK_DAYS = int(getattr(config, "BINANCE_DEPOSIT_LOOKBACK_DAYS", 7))
+    BINANCE_LOOKBACK_DAYS = int(
+        getattr(config, "BINANCE_DEPOSIT_LOOKBACK_DAYS", 7)
+    )
 except (TypeError, ValueError):
     BINANCE_LOOKBACK_DAYS = 7
 
-BINANCE_CONFIRMED_STATUS = 1
 
-BEP20_ADDRESS = getattr(config, "BEP20_ADDRESS", "").lower()
-POLYGON_ADDRESS = getattr(config, "POLYGON_ADDRESS", "").lower()
-UPI_NETWORK = "UPI"
+# ================================================================
+# WALLET ADDRESSES
+# ================================================================
 
-# Official Contracts
+BEP20_ADDRESS = str(
+    getattr(config, "BEP20_ADDRESS", "") or ""
+).strip().lower()
+
+POLYGON_ADDRESS = str(
+    getattr(config, "POLYGON_ADDRESS", "") or ""
+).strip().lower()
+
+
+# ================================================================
+# RPC CONFIGURATION
+# ================================================================
+
+BSC_RPC_URLS = getattr(
+    config,
+    "BSC_RPC_URLS",
+    [
+        getattr(
+            config,
+            "BSC_RPC_URL",
+            "https://bsc-dataseed.binance.org/",
+        )
+    ],
+)
+
+POLYGON_RPC_URLS = getattr(
+    config,
+    "POLYGON_RPC_URLS",
+    [
+        getattr(
+            config,
+            "POLYGON_RPC_URL",
+            "https://polygon-rpc.com/",
+        )
+    ],
+)
+
+
+def _normalise_rpc_urls(value) -> list[str]:
+    if isinstance(value, str):
+        return [
+            x.strip()
+            for x in value.split(",")
+            if x.strip()
+        ]
+
+    if isinstance(value, (list, tuple)):
+        return [
+            str(x).strip()
+            for x in value
+            if str(x).strip()
+        ]
+
+    return []
+
+
+BSC_RPC_URLS = _normalise_rpc_urls(BSC_RPC_URLS)
+POLYGON_RPC_URLS = _normalise_rpc_urls(POLYGON_RPC_URLS)
+
+
+# ================================================================
+# CONFIRMATIONS
+# ================================================================
+
+RPC_CONFIRMATIONS = {
+    "BEP20": int(
+        getattr(config, "BSC_REQUIRED_CONFIRMATIONS", 3)
+    ),
+    "POLYGON": int(
+        getattr(config, "POLYGON_REQUIRED_CONFIRMATIONS", 3)
+    ),
+}
+
+
+# ================================================================
+# RPC TIMEOUT
+# ================================================================
+
+RPC_TIMEOUT = int(
+    getattr(config, "RPC_TIMEOUT_SECONDS", 10)
+)
+
+
+# ================================================================
+# RPC CACHE
+# ================================================================
+
+RPC_CACHE_TTL = int(
+    getattr(config, "RPC_CACHE_TTL_SECONDS", 5)
+)
+
+_rpc_cache = {}
+
+
+# ================================================================
+# TOKEN CONTRACTS
+# ================================================================
+
 OFFICIAL_CONTRACTS = {
     "BEP20": {
         "USDT": "0x55d398326f99059ff775485246999027b3197955",
         "BUSD": "0xe9e7cea3dedca5984780bafc599bd69add087d56",
         "USDC": "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
     },
+
     "POLYGON": {
         "USDT": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
         "USDC": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
     },
 }
 
-# Progressive confirmation tiers per network
-NETWORK_CONFIRMATION_TIERS = {
-    "BEP20": {"verified_contract": 1, "missing_contract": 3},      # 3s / 9s
-    "POLYGON": {"verified_contract": 1, "missing_contract": 5},    # 2s / 10s
+
+# ================================================================
+# TOKEN DECIMALS
+# ================================================================
+
+TOKEN_DECIMALS = {
+    "BEP20": {
+        "USDT": 18,
+        "BUSD": 18,
+        "USDC": 18,
+    },
+
+    "POLYGON": {
+        "USDT": 6,
+        "USDC": 6,
+    },
 }
-MAX_WAIT_SECONDS = 60   # After 60 seconds, accept at 1 confirmation (flash USDT impossible)
-CHECK_INTERVAL = 10      # Check every 10 seconds
-
-BSCSCAN_API_KEY = getattr(config, "BSCSCAN_API_KEY", "")
-POLYGONSCAN_API_KEY = getattr(config, "POLYGONSCAN_API_KEY", "")
-ETHERSCAN_V2_API_KEY = getattr(config, "ETHERSCAN_V2_API_KEY", "")
-
-# Layer Toggles
-ENABLE_CONTRACT_CHECK = getattr(config, "ENABLE_CONTRACT_CHECK", True)
-ENABLE_BLOCKLIST_CHECK = getattr(config, "ENABLE_BLOCKLIST_CHECK", True)
-ENABLE_SENDER_BLOCKLIST = getattr(config, "ENABLE_SENDER_BLOCKLIST", True)
-ENABLE_CONFIRMATION_CHECK = getattr(config, "ENABLE_CONFIRMATION_CHECK", True)
-ENABLE_FINALITY_CHECK = getattr(config, "ENABLE_FINALITY_CHECK", False)
-ENABLE_SWAP_LIQUIDITY = getattr(config, "ENABLE_SWAP_LIQUIDITY", False)
-ENABLE_EXPLORER_CHECK = getattr(config, "ENABLE_EXPLORER_CHECK", True)
-ENABLE_TIMESTAMP_CHECK = getattr(config, "ENABLE_TIMESTAMP_CHECK", True)
-ENABLE_VALUE_CHECK = getattr(config, "ENABLE_VALUE_CHECK", True)
-ENABLE_DUST_CHECK = getattr(config, "ENABLE_DUST_CHECK", True)
-
-KNOWN_FAKE_CONTRACTS = getattr(config, "KNOWN_FAKE_CONTRACTS", [])
-KNOWN_SCAM_SENDERS = getattr(config, "KNOWN_SCAM_SENDERS", [])
-MIN_DEPOSIT_USD = getattr(config, "MIN_DEPOSIT_USD", 0.01)
-
-# Binance Pay
-BINANCE_PAY_NETWORK = "BINANCE"
-PAY_TRANSACTIONS_URL = "https://api.binance.com/sapi/v1/pay/transactions"
-PAY_TRANSACTION_MATCH_FIELDS = ("transactionId", "orderId", "id", "referenceId", "merchantTradeNo")
-
-try:
-    BINANCE_PAY_LOOKBACK_DAYS = int(getattr(config, "BINANCE_PAY_LOOKBACK_DAYS", 7))
-except (TypeError, ValueError):
-    BINANCE_PAY_LOOKBACK_DAYS = 7
-
-BINANCE_PAY_ACCEPTED_CURRENCIES = getattr(config, "BINANCE_PAY_ACCEPTED_CURRENCIES", ["USDT", "BUSD", "USDC"])
-ORDER_ID_RE = re.compile(r"^[A-Za-z0-9]{8,32}$")
-
-try:
-    AMOUNT_TOLERANCE = Decimal(str(getattr(config, "DEPOSIT_AMOUNT_TOLERANCE", "0.01")))
-except (InvalidOperation, ValueError):
-    AMOUNT_TOLERANCE = Decimal("0.01")
-
-ALLOW_OVERPAY = getattr(config, "DEPOSIT_ALLOW_OVERPAY", True)
-try:
-    MAX_CHECK_ATTEMPTS = int(getattr(config, "DEPOSIT_MAX_CHECK_ATTEMPTS", 60))
-except (TypeError, ValueError):
-    MAX_CHECK_ATTEMPTS = 60
-
-_check_attempts: dict[int, int] = {}
-DELETE_FAILED_DEPOSITS = getattr(config, "DEPOSIT_DELETE_FAILED", False)
-DEPOSIT_BEFORE_TX_GRACE_DAYS = getattr(config, "DEPOSIT_BEFORE_TX_GRACE_DAYS", 5)
-
-IMAP_HOST = getattr(config, "IMAP_HOST", "imap.gmail.com")
-IMAP_EMAIL = getattr(config, "IMAP_EMAIL", "")
-IMAP_APP_PASSWORD = getattr(config, "IMAP_APP_PASSWORD", "")
-FAMAPP_SENDER_EMAIL = getattr(config, "FAMAPP_SENDER_EMAIL", "")
-UPI_ID = getattr(config, "UPI_ID", "")
-IMAP_LOOKBACK_DAYS = getattr(config, "IMAP_LOOKBACK_DAYS", 1)
-MAX_EMAILS_TO_SCAN = getattr(config, "UPI_MAX_EMAILS_TO_SCAN", 40)
-
-UTR_RE = re.compile(r"^\d{12}$")
-TXN_ID_RE = re.compile(r"^[A-Za-z]{3,10}\d{6,15}$")
-UTR_SPECIFIC_RE = re.compile(
-    r"(?:UTR(?:\s*No\.?)?|UPI\s*Ref(?:erence)?(?:\s*No\.?)?|RRN)[\s:\-]{0,10}(\d{12})", re.IGNORECASE)
-TXN_ID_SPECIFIC_RE = re.compile(
-    r"(?:Txn\s*(?:ID|Ref(?:erence)?)|Transaction\s*ID|Reference\s*ID)[\s:\-]{0,10}([A-Za-z]{3,10}\d{6,15})", re.IGNORECASE)
-UTR_FALLBACK_RE = re.compile(r"\b(\d{12})\b")
-TXN_ID_FALLBACK_RE = re.compile(r"\b([A-Za-z]{3,10}\d{6,15})\b")
-AMOUNT_RE = re.compile(r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
-RECEIVED_AMOUNT_RE = re.compile(
-    r"(?:Received|Credited|Payment\s+of|Amount\s+Received|Paid)[:\s]*"
-    r"(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
-
-TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
-
-_binance_client: Optional[Client] = None
 
 
-def valid_hash(tx_hash: str) -> bool:
-    return bool(TX_HASH_RE.match(tx_hash)) if isinstance(tx_hash, str) else False
-
-
-def valid_order_id(order_id: str) -> bool:
-    return bool(ORDER_ID_RE.match(order_id)) if isinstance(order_id, str) else False
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                    DATA CLASSES                             ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# NETWORKS
+# ================================================================
 
 @dataclass
 class Chain:
     name: str
     address: str
     binance_network: str
+    rpc_urls: list[str]
     contracts: dict = field(default_factory=dict)
-    explorer_url: str = ""
-    explorer_api_key: str = ""
     chain_id: int = 0
 
 
@@ -181,873 +252,2750 @@ CHAINS = {
     "BEP20": Chain(
         name="BEP20",
         address=BEP20_ADDRESS,
-        binance_network=NETWORK_MAP.get("BEP20", "BSC"),
-        contracts=OFFICIAL_CONTRACTS.get("BEP20", {}),
-        explorer_url="https://api.etherscan.io/v2/api",
-        explorer_api_key=ETHERSCAN_V2_API_KEY or BSCSCAN_API_KEY,
+        binance_network=getattr(
+            config,
+            "BINANCE_BEP20_NETWORK",
+            "BSC",
+        ),
+        rpc_urls=BSC_RPC_URLS,
+        contracts=OFFICIAL_CONTRACTS["BEP20"],
         chain_id=56,
     ),
+
     "POLYGON": Chain(
         name="POLYGON",
         address=POLYGON_ADDRESS,
-        binance_network=NETWORK_MAP.get("POLYGON", "MATIC"),
-        contracts=OFFICIAL_CONTRACTS.get("POLYGON", {}),
-        explorer_url="https://api.etherscan.io/v2/api",
-        explorer_api_key=ETHERSCAN_V2_API_KEY or POLYGONSCAN_API_KEY,
+        binance_network=getattr(
+            config,
+            "BINANCE_POLYGON_NETWORK",
+            "MATIC",
+        ),
+        rpc_urls=POLYGON_RPC_URLS,
+        contracts=OFFICIAL_CONTRACTS["POLYGON"],
         chain_id=137,
     ),
 }
 
-@dataclass
-class VerificationResult:
-    passed: bool
-    layer: str
-    reason: str = ""
-    details: dict = field(default_factory=dict)
+
+# ================================================================
+# UPI
+# ================================================================
+
+UPI_NETWORK = "UPI"
+UPI_ID = getattr(config, "UPI_ID", "")
+
+IMAP_HOST = getattr(
+    config,
+    "IMAP_HOST",
+    "imap.gmail.com",
+)
+
+IMAP_EMAIL = getattr(config, "IMAP_EMAIL", "")
+IMAP_APP_PASSWORD = getattr(
+    config,
+    "IMAP_APP_PASSWORD",
+    "",
+)
+
+FAMAPP_SENDER_EMAIL = getattr(
+    config,
+    "FAMAPP_SENDER_EMAIL",
+    "",
+)
+
+IMAP_LOOKBACK_DAYS = int(
+    getattr(config, "IMAP_LOOKBACK_DAYS", 1)
+)
+
+MAX_EMAILS_TO_SCAN = int(
+    getattr(config,
+    "UPI_MAX_EMAILS_TO_SCAN",
+    40)
+)
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                    HELPERS                                  ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# BINANCE PAY
+# ================================================================
+
+BINANCE_PAY_NETWORK = "BINANCE"
+
+PAY_TRANSACTIONS_URL = (
+    "https://api.binance.com/sapi/v1/pay/transactions"
+)
+
+PAY_TRANSACTION_MATCH_FIELDS = (
+    "transactionId",
+    "orderId",
+    "id",
+    "referenceId",
+    "merchantTradeNo",
+)
+
+BINANCE_PAY_ACCEPTED_CURRENCIES = getattr(
+    config,
+    "BINANCE_PAY_ACCEPTED_CURRENCIES",
+    ["USDT", "BUSD", "USDC"],
+)
+
+try:
+    BINANCE_PAY_LOOKBACK_DAYS = int(
+        getattr(
+            config,
+            "BINANCE_PAY_LOOKBACK_DAYS",
+            7,
+        )
+    )
+except (TypeError, ValueError):
+    BINANCE_PAY_LOOKBACK_DAYS = 7
+
+
+# ================================================================
+# DEPOSIT SETTINGS
+# ================================================================
+
+try:
+    AMOUNT_TOLERANCE = Decimal(
+        str(
+            getattr(
+                config,
+                "DEPOSIT_AMOUNT_TOLERANCE",
+                "0.000001",
+            )
+        )
+    )
+except (InvalidOperation, ValueError):
+    AMOUNT_TOLERANCE = Decimal("0.000001")
+
+
+try:
+    MAX_CHECK_ATTEMPTS = int(
+        getattr(
+            config,
+            "DEPOSIT_MAX_CHECK_ATTEMPTS",
+            180,
+        )
+    )
+except (TypeError, ValueError):
+    MAX_CHECK_ATTEMPTS = 180
+
+
+CHECK_INTERVAL = int(
+    getattr(
+        config,
+        "DEPOSIT_CHECK_INTERVAL",
+        10,
+    )
+)
+
+MIN_DEPOSIT_USD = Decimal(
+    str(
+        getattr(
+            config,
+            "MIN_DEPOSIT_USD",
+            "0.01",
+        )
+    )
+)
+
+
+# ================================================================
+# UPI REGEX
+# ================================================================
+
+UTR_RE = re.compile(r"^\d{12}$")
+
+TXN_ID_RE = re.compile(
+    r"^[A-Za-z]{3,10}\d{6,15}$"
+)
+
+UTR_SPECIFIC_RE = re.compile(
+    r"(?:UTR(?:\s*No\.?)?|UPI\s*Ref(?:erence)?"
+    r"(?:\s*No\.?)?|RRN)"
+    r"[\s:\-]{0,10}(\d{12})",
+    re.IGNORECASE,
+)
+
+TXN_ID_SPECIFIC_RE = re.compile(
+    r"(?:Txn\s*(?:ID|Ref(?:erence)?)|"
+    r"Transaction\s*ID|Reference\s*ID)"
+    r"[\s:\-]{0,10}"
+    r"([A-Za-z]{3,10}\d{6,15})",
+    re.IGNORECASE,
+)
+
+UTR_FALLBACK_RE = re.compile(
+    r"\b(\d{12})\b"
+)
+
+TXN_ID_FALLBACK_RE = re.compile(
+    r"\b([A-Za-z]{3,10}\d{6,15})\b"
+)
+
+AMOUNT_RE = re.compile(
+    r"(?:₹|Rs\.?|INR)\s*"
+    r"([\d,]+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+
+RECEIVED_AMOUNT_RE = re.compile(
+    r"(?:Received|Credited|Payment\s+of|"
+    r"Amount\s+Received|Paid)"
+    r"[:\s]*"
+    r"(?:₹|Rs\.?|INR)?\s*"
+    r"([\d,]+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+
+
+TX_HASH_RE = re.compile(
+    r"^0x[0-9a-fA-F]{64}$"
+)
+
+
+ORDER_ID_RE = re.compile(
+    r"^[A-Za-z0-9]{8,32}$"
+)
+
+
+# ================================================================
+# ERC20 TRANSFER EVENT
+# ================================================================
+
+TRANSFER_TOPIC = Web3.keccak(
+    text="Transfer(address,address,uint256)"
+).hex().lower()
+
+
+# ================================================================
+# STATE
+# ================================================================
+
+_check_attempts: dict[int, int] = {}
+
+_binance_client: Optional[Client] = None
+
+
+# ================================================================
+# VALIDATORS
+# ================================================================
+
+def valid_hash(tx_hash: str) -> bool:
+    return (
+        isinstance(tx_hash, str)
+        and bool(TX_HASH_RE.fullmatch(tx_hash.strip()))
+    )
+
+
+def valid_order_id(order_id: str) -> bool:
+    return (
+        isinstance(order_id, str)
+        and bool(ORDER_ID_RE.fullmatch(order_id.strip()))
+    )
+
+
+def valid_utr(utr: str) -> bool:
+    return (
+        isinstance(utr, str)
+        and bool(
+            UTR_RE.fullmatch(utr)
+            or TXN_ID_RE.fullmatch(utr)
+        )
+    )
+
+
+# ================================================================
+# BINANCE CLIENT
+# ================================================================
 
 def _get_binance_client() -> Optional[Client]:
     global _binance_client
+
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        logger.warning(
+            "Binance API credentials not configured"
+        )
         return None
+
+    if _binance_client is not None:
+        return _binance_client
+
     try:
-        _binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        server_time = _binance_client.get_server_time()["serverTime"]
-        _binance_client.timestamp_offset = server_time - int(time_module.time() * 1000)
-        logger.info("Binance synced | offset=%sms", _binance_client.timestamp_offset)
-    except Exception as e:
-        logger.error("Binance init failed: %s", e)
-        _binance_client = None
-    return _binance_client
-
-
-def _record_pending_attempt(deposit_id: int) -> int:
-    count = _check_attempts.get(deposit_id, 0) + 1
-    _check_attempts[deposit_id] = count
-    return count
-
-
-def _clear_pending_attempts(deposit_id: int) -> None:
-    _check_attempts.pop(deposit_id, None)
-
-
-def _finalize_failed(db, deposit: Deposit, reason: str) -> None:
-    if DELETE_FAILED_DEPOSITS:
-        db.delete(deposit)
-    else:
-        deposit.status = "failed"
-    db.commit()
-    logger.warning("Deposit %s FAILED: %s", deposit.id, reason)
-    _clear_pending_attempts(deposit.id)
-
-
-def _parse_confirmations(raw_value) -> int:
-    if raw_value is None:
-        return 0
-    try:
-        if isinstance(raw_value, str):
-            raw_value = raw_value.strip()
-            if not raw_value:
-                return 0
-            if "/" in raw_value:
-                parts = raw_value.split("/")
-                return int(parts[0].strip()) if parts[0].strip().isdigit() else 0
-            if raw_value.isdigit():
-                return int(raw_value)
-            return 0
-        elif isinstance(raw_value, (int, float)):
-            return int(raw_value)
-        elif isinstance(raw_value, bool):
-            return 1 if raw_value else 0
-        return 0
-    except (ValueError, TypeError):
-        return 0
-
-
-def _get_coin_from_row(row: dict) -> str:
-    coin = (row.get("coin") or row.get("asset") or "").upper()
-    return coin if coin in ["USDT", "BUSD", "USDC"] else "USDT"
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  LAYER 1-7: QUICK CHECKS (instant rejection or pass)       ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-def _layer_1_contract_check(chain: Chain, row: dict, tx_hash: str, coin: str) -> VerificationResult:
-    if not ENABLE_CONTRACT_CHECK:
-        return VerificationResult(True, "L1_CONTRACT", "disabled")
-    official = chain.contracts.get(coin, "")
-    received = (row.get("contractAddress") or row.get("tokenContractAddress") or
-                row.get("tokenAddress") or "").lower()
-    if not official:
-        return VerificationResult(True, "L1_CONTRACT", "no_official_contract")
-    if not received:
-        return VerificationResult(True, "L1_CONTRACT", "no_contract_data")
-    if received != official:
-        return VerificationResult(False, "L1_CONTRACT", "contract_mismatch",
-                                  {"official": official[:16], "received": received[:16]})
-    return VerificationResult(True, "L1_CONTRACT", "verified")
-
-
-def _layer_2_blocklist_check(chain: Chain, row: dict, tx_hash: str, coin: str) -> VerificationResult:
-    if not ENABLE_BLOCKLIST_CHECK:
-        return VerificationResult(True, "L2_BLOCKLIST", "disabled")
-    received = (row.get("contractAddress") or row.get("tokenContractAddress") or "").lower()
-    if not received:
-        return VerificationResult(True, "L2_BLOCKLIST", "no_contract")
-    for fake in KNOWN_FAKE_CONTRACTS:
-        if received == fake.lower():
-            return VerificationResult(False, "L2_BLOCKLIST", "known_fake")
-    return VerificationResult(True, "L2_BLOCKLIST", "clean")
-
-
-def _layer_3_sender_check(chain: Chain, row: dict, tx_hash: str, coin: str) -> VerificationResult:
-    if not ENABLE_SENDER_BLOCKLIST or not KNOWN_SCAM_SENDERS:
-        return VerificationResult(True, "L3_SENDER", "disabled_or_empty")
-    sender = (row.get("fromAddress") or row.get("sender") or "").lower()
-    if not sender:
-        return VerificationResult(True, "L3_SENDER", "no_data")
-    for scammer in KNOWN_SCAM_SENDERS:
-        if sender == scammer.lower():
-            return VerificationResult(False, "L3_SENDER", "known_scammer")
-    return VerificationResult(True, "L3_SENDER", "clean")
-
-
-def _layer_5_explorer_check(chain: Chain, row: dict, tx_hash: str, coin: str) -> VerificationResult:
-    if not ENABLE_EXPLORER_CHECK or not chain.explorer_api_key:
-        return VerificationResult(True, "L5_EXPLORER", "disabled")
-    try:
-        resp = requests.get(chain.explorer_url, params={
-            "chainid": chain.chain_id,
-            "module": "account",
-            "action": "tokentx",
-            "txhash": tx_hash,
-            "apikey": chain.explorer_api_key,
-        }, timeout=10)
-        data = resp.json()
-        if data.get("status") != "1" or not data.get("result"):
-            return VerificationResult(True, "L5_EXPLORER", "not_found_or_api_error")
-        return VerificationResult(True, "L5_EXPLORER", "verified")
-    except Exception:
-        return VerificationResult(True, "L5_EXPLORER", "timeout")
-
-
-def _layer_6_timestamp_check(chain: Chain, row: dict, tx_hash: str, coin: str,
-                              deposit_created_at: Optional[datetime] = None) -> VerificationResult:
-    if not ENABLE_TIMESTAMP_CHECK:
-        return VerificationResult(True, "L6_TIME", "disabled")
-    ts = row.get("insertTime") or row.get("timestamp") or 0
-    try:
-        tx_time = datetime.fromtimestamp(int(ts) / 1000.0)
-    except:
-        return VerificationResult(True, "L6_TIME", "no_timestamp")
-    if tx_time > datetime.now() + timedelta(minutes=5):
-        return VerificationResult(False, "L6_TIME", "future")
-    if deposit_created_at and tx_time < deposit_created_at - timedelta(days=DEPOSIT_BEFORE_TX_GRACE_DAYS):
-        return VerificationResult(False, "L6_TIME", "too_old")
-    return VerificationResult(True, "L6_TIME", "valid")
-
-
-def _layer_7_value_check(chain: Chain, row: dict, tx_hash: str, coin: str,
-                          requested: Optional[Decimal] = None) -> VerificationResult:
-    if not ENABLE_VALUE_CHECK:
-        return VerificationResult(True, "L7_VALUE", "disabled")
-    try:
-        amount = Decimal(str(row.get("amount", "0")))
-    except:
-        return VerificationResult(False, "L7_VALUE", "invalid")
-    if amount <= 0:
-        return VerificationResult(False, "L7_VALUE", "zero_or_negative")
-    if ENABLE_DUST_CHECK and float(amount) < MIN_DEPOSIT_USD:
-        return VerificationResult(False, "L7_VALUE", "dust")
-    if requested and amount < requested - AMOUNT_TOLERANCE:
-        return VerificationResult(False, "L7_VALUE", "underpaid")
-    return VerificationResult(True, "L7_VALUE", "valid")
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  LAYER 8: PROGRESSIVE CONFIRMATIONS (wait, never fail)     ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-def _layer_8_confirmation_check(chain: Chain, row: dict, tx_hash: str, coin: str,
-                                 contract_passed: bool = True,
-                                 deposit_created_at: Optional[datetime] = None) -> VerificationResult:
-    """
-    PROGRESSIVE CONFIRMATION REQUIREMENTS — Never permanently fails.
-
-    RISK-BASED TIERS:
-      • Contract VERIFIED → 1 confirmation (~3 sec BSC, ~2 sec Polygon)
-      • Contract MISSING (Trust Wallet) → 3-5 confirmations (~9-10 sec)
-
-    60-SECOND FALLBACK:
-      • If deposit is older than 60 seconds → ACCEPT at 1 confirmation
-      • Flash USDT CANNOT survive 60+ seconds on any chain
-      • This ensures NO legitimate deposit ever fails
-
-    RETURNS:
-      • "retry" in details → Check again next poll (NEVER permanent fail)
-    """
-    if not ENABLE_CONFIRMATION_CHECK:
-        return VerificationResult(True, "L8_CONF", "disabled")
-
-    raw = row.get("confirmTimes") or row.get("confirmations") or row.get("confirmNo") or 0
-    confs = _parse_confirmations(raw)
-
-    # Determine required confirmations based on risk
-    tiers = NETWORK_CONFIRMATION_TIERS.get(chain.name,
-                                           {"verified_contract": 1, "missing_contract": 3})
-    required = tiers["verified_contract"] if contract_passed else tiers["missing_contract"]
-
-    # 60-second fallback: if deposit is old enough, reduce to 1 confirmation
-    if deposit_created_at:
-        tx_age = (datetime.now() - deposit_created_at).total_seconds()
-        if tx_age > MAX_WAIT_SECONDS:
-            required = 1
-
-    if confs < required:
-        return VerificationResult(
-            False, "L8_CONF", "waiting_for_blocks",
-            {
-                "current": confs,
-                "required": required,
-                "retry": True,       # ← ALWAYS retry, never fail
-                "retry_in_seconds": CHECK_INTERVAL
-            }
+        client = Client(
+            BINANCE_API_KEY,
+            BINANCE_API_SECRET,
         )
 
-    return VerificationResult(True, "L8_CONF", "sufficient",
-                             {"confirmations": confs, "required": required})
+        try:
+            server_time = client.get_server_time()[
+                "serverTime"
+            ]
+
+            client.timestamp_offset = (
+                server_time
+                - int(time_module.time() * 1000)
+            )
+
+        except Exception:
+            pass
+
+        _binance_client = client
+
+        logger.info("Binance client initialized")
+
+        return _binance_client
+
+    except Exception as exc:
+        logger.error(
+            "Binance initialization failed: %s",
+            exc,
+        )
+
+        _binance_client = None
+
+        return None
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  LAYER 9: ADVISORY ONLY (never rejects)                    ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# RPC
+# ================================================================
 
-def _layer_9_liquidity_check(chain: Chain, row: dict, tx_hash: str, coin: str) -> VerificationResult:
-    if not ENABLE_SWAP_LIQUIDITY:
-        return VerificationResult(True, "L9_LIQ", "disabled")
-    # Always returns True — advisory only
-    return VerificationResult(True, "L9_LIQ", "advisory")
+def _get_web3(chain: Chain) -> Optional[Web3]:
+    """
+    Return a working RPC connection.
+
+    RPC URLs are tried in order.
+    """
+
+    if not chain.rpc_urls:
+        logger.error(
+            "[%s] No RPC URLs configured",
+            chain.name,
+        )
+        return None
+
+    cache_key = f"rpc:{chain.name}"
+
+    cached = _rpc_cache.get(cache_key)
+
+    if cached:
+        created = cached.get("time", 0)
+
+        if (
+            time_module.time() - created
+            < RPC_CACHE_TTL
+        ):
+            return cached["web3"]
+
+    for rpc_url in chain.rpc_urls:
+
+        try:
+            provider = Web3.HTTPProvider(
+                rpc_url,
+                request_kwargs={
+                    "timeout": RPC_TIMEOUT
+                },
+            )
+
+            w3 = Web3(provider)
+
+            if not w3.is_connected():
+                logger.warning(
+                    "[%s] RPC unavailable: %s",
+                    chain.name,
+                    rpc_url,
+                )
+                continue
+
+            actual_chain_id = w3.eth.chain_id
+
+            if actual_chain_id != chain.chain_id:
+                logger.error(
+                    "[%s] Wrong chain ID from RPC %s: %s",
+                    chain.name,
+                    rpc_url,
+                    actual_chain_id,
+                )
+                continue
+
+            _rpc_cache[cache_key] = {
+                "web3": w3,
+                "time": time_module.time(),
+            }
+
+            return w3
+
+        except Exception as exc:
+            logger.warning(
+                "[%s] RPC failed %s: %s",
+                chain.name,
+                rpc_url,
+                exc,
+            )
+
+    return None
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  RUN ALL LAYERS                                            ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# RPC TRANSACTION VERIFICATION
+# ================================================================
 
-def _verify_all_layers(chain: Chain, row: dict, tx_hash: str, coin: str,
-                       deposit_created_at=None, requested_amount=None):
-    results = []
+def _decode_transfer_logs(
+    w3: Web3,
+    receipt,
+    chain: Chain,
+    tx_hash: str,
+    expected_recipient: str,
+    expected_amount: Optional[Decimal],
+):
+    """
+    Find the ERC20 Transfer event corresponding to
+    the user's deposit.
 
-    # L1: Contract (hard fail)
-    r1 = _layer_1_contract_check(chain, row, tx_hash, coin)
-    results.append(r1)
-    if not r1.passed: return results
+    Does not trust token symbol/name.
+    """
 
-    # L2: Blocklist (hard fail)
-    r2 = _layer_2_blocklist_check(chain, row, tx_hash, coin)
-    results.append(r2)
-    if not r2.passed: return results
+    expected_recipient = (
+        expected_recipient or ""
+    ).lower()
 
-    # L3: Sender blocklist (hard fail)
-    r3 = _layer_3_sender_check(chain, row, tx_hash, coin)
-    results.append(r3)
-    if not r3.passed: return results
+    transfers = []
 
-    # L4: Dedup (always pass)
-    results.append(VerificationResult(True, "L4_DEDUP", "passed"))
+    for log in receipt["logs"]:
 
-    # L5: Explorer (advisory — never stops)
-    results.append(_layer_5_explorer_check(chain, row, tx_hash, coin))
+        try:
+            topics = log["topics"]
 
-    # L6: Timestamp (hard fail for future/too-old only)
-    r6 = _layer_6_timestamp_check(chain, row, tx_hash, coin, deposit_created_at)
-    results.append(r6)
-    if not r6.passed: return results
+            if not topics:
+                continue
 
-    # L7: Value (hard fail)
-    r7 = _layer_7_value_check(chain, row, tx_hash, coin, requested_amount)
-    results.append(r7)
-    if not r7.passed: return results
+            topic0 = topics[0].hex().lower()
 
-    # L8: Confirmations (ALWAYS RETRY — never permanent fail)
-    contract_verified = r1.passed and r1.reason == "verified"
-    r8 = _layer_8_confirmation_check(chain, row, tx_hash, coin,
-                                      contract_verified, deposit_created_at)
-    results.append(r8)
-    if not r8.passed: return results
+            if topic0 != TRANSFER_TOPIC:
+                continue
 
-    # L9: Advisory
-    results.append(_layer_9_liquidity_check(chain, row, tx_hash, coin))
+            token_contract = (
+                log["address"].lower()
+            )
 
-    return results
+            if token_contract not in {
+                x.lower()
+                for x in chain.contracts.values()
+            }:
+                continue
+
+            if len(topics) < 3:
+                continue
+
+            from_address = (
+                "0x"
+                + topics[1].hex()[-40:]
+            ).lower()
+
+            to_address = (
+                "0x"
+                + topics[2].hex()[-40:]
+            ).lower()
+
+            if to_address != expected_recipient:
+                continue
+
+            raw_value = int(
+                log["data"].hex(),
+                16,
+            )
+
+            transfers.append(
+                {
+                    "token_contract": token_contract,
+                    "from": from_address,
+                    "to": to_address,
+                    "raw_amount": raw_value,
+                    "log_index": int(
+                        log["logIndex"]
+                    ),
+                }
+            )
+
+        except Exception:
+            logger.exception(
+                "[%s] Failed decoding Transfer log",
+                chain.name,
+            )
+
+    if not transfers:
+        return None
+
+    # ------------------------------------------------------------
+    # Match amount if requested
+    # ------------------------------------------------------------
+
+    if expected_amount is not None:
+
+        for transfer in transfers:
+
+            contract = transfer[
+                "token_contract"
+            ]
+
+            coin = None
+
+            for name, address in chain.contracts.items():
+
+                if address.lower() == contract:
+                    coin = name
+                    break
+
+            if coin is None:
+                continue
+
+            decimals = TOKEN_DECIMALS[
+                chain.name
+            ].get(coin)
+
+            if decimals is None:
+                continue
+
+            actual_amount = (
+                Decimal(
+                    transfer["raw_amount"]
+                )
+                / (
+                    Decimal(10)
+                    ** decimals
+                )
+            )
+
+            if actual_amount >= (
+                expected_amount
+                - AMOUNT_TOLERANCE
+            ):
+                transfer[
+                    "amount"
+                ] = actual_amount
+
+                transfer[
+                    "coin"
+                ] = coin
+
+                return transfer
+
+        return None
+
+    # No requested amount.
+    # Select the first valid transfer.
+
+    transfer = transfers[0]
+
+    contract = transfer[
+        "token_contract"
+    ]
+
+    for name, address in chain.contracts.items():
+
+        if address.lower() == contract:
+
+            coin = name
+
+            decimals = TOKEN_DECIMALS[
+                chain.name
+            ][coin]
+
+            transfer["coin"] = coin
+
+            transfer["amount"] = (
+                Decimal(
+                    transfer["raw_amount"]
+                )
+                / (
+                    Decimal(10)
+                    ** decimals
+                )
+            )
+
+            return transfer
+
+    return None
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  FETCH + MATCH                                             ║
-# ╚══════════════════════════════════════════════════════════════╝
+def _verify_rpc_transaction_sync(
+    chain: Chain,
+    tx_hash: str,
+    requested_amount: Optional[Decimal],
+):
+    """
+    Complete on-chain verification.
 
-def _fetch_binance_deposits_sync(binance_network: str) -> list[dict]:
+    Returns:
+        dict  -> valid transaction
+        None  -> not yet available / RPC temporary failure
+        False -> permanently invalid
+    """
+
+    w3 = _get_web3(chain)
+
+    if w3 is None:
+        return None
+
+    try:
+
+        # --------------------------------------------------------
+        # Transaction
+        # --------------------------------------------------------
+
+        try:
+            tx = w3.eth.get_transaction(
+                tx_hash
+            )
+        except TransactionNotFound:
+            logger.info(
+                "[%s] TX not found: %s",
+                chain.name,
+                tx_hash[:18],
+            )
+            return None
+
+        # --------------------------------------------------------
+        # Receipt
+        # --------------------------------------------------------
+
+        try:
+            receipt = (
+                w3.eth.get_transaction_receipt(
+                    tx_hash
+                )
+            )
+
+        except TransactionNotFound:
+            logger.info(
+                "[%s] TX not mined yet: %s",
+                chain.name,
+                tx_hash[:18],
+            )
+            return None
+
+        # --------------------------------------------------------
+        # Transaction status
+        # --------------------------------------------------------
+
+        status = int(
+            receipt.get("status", 0)
+        )
+
+        if status != 1:
+
+            logger.warning(
+                "[%s] TX reverted: %s",
+                chain.name,
+                tx_hash[:18],
+            )
+
+            return False
+
+        # --------------------------------------------------------
+        # Block
+        # --------------------------------------------------------
+
+        tx_block = int(
+            receipt["blockNumber"]
+        )
+
+        latest_block = int(
+            w3.eth.block_number
+        )
+
+        confirmations = (
+            latest_block
+            - tx_block
+            + 1
+        )
+
+        # --------------------------------------------------------
+        # Recipient
+        # --------------------------------------------------------
+
+        expected_recipient = (
+            chain.address or ""
+        ).lower()
+
+        if not expected_recipient:
+
+            logger.error(
+                "[%s] Deposit address not configured",
+                chain.name,
+            )
+
+            return False
+
+        # --------------------------------------------------------
+        # Decode ERC20 Transfer
+        # --------------------------------------------------------
+
+        transfer = _decode_transfer_logs(
+            w3=w3,
+            receipt=receipt,
+            chain=chain,
+            tx_hash=tx_hash,
+            expected_recipient=expected_recipient,
+            expected_amount=requested_amount,
+        )
+
+        if transfer is None:
+
+            logger.info(
+                "[%s] No valid token transfer found: %s",
+                chain.name,
+                tx_hash[:18],
+            )
+
+            return None
+
+        # --------------------------------------------------------
+        # Confirmation requirement
+        # --------------------------------------------------------
+
+        required = RPC_CONFIRMATIONS.get(
+            chain.name,
+            3,
+        )
+
+        confirmed = (
+            confirmations >= required
+        )
+
+        result = {
+            "tx_hash": tx_hash,
+            "sender": transfer["from"],
+            "receiver": transfer["to"],
+            "amount": transfer["amount"],
+            "coin": transfer["coin"],
+            "contract": transfer[
+                "token_contract"
+            ],
+            "network": chain.name,
+            "block_number": tx_block,
+            "latest_block": latest_block,
+            "confirmations": confirmations,
+            "required_confirmations": required,
+            "confirmed": confirmed,
+            "rpc_verified": True,
+            "tx_status": status,
+            "transaction": tx,
+            "receipt": receipt,
+        }
+
+        logger.info(
+            "[%s] RPC | tx=%s | coin=%s | amount=%s | "
+            "block=%s | confirmations=%s/%s | confirmed=%s",
+            chain.name,
+            tx_hash[:18],
+            transfer["coin"],
+            transfer["amount"],
+            tx_block,
+            confirmations,
+            required,
+            confirmed,
+        )
+
+        return result
+
+    except Exception as exc:
+
+        logger.warning(
+            "[%s] RPC verification error: %s",
+            chain.name,
+            exc,
+        )
+
+        # Temporary RPC error.
+        return None
+
+
+async def verify_rpc_transaction(
+    chain: Chain,
+    tx_hash: str,
+    requested_amount: Optional[Decimal],
+):
+    return await asyncio.to_thread(
+        _verify_rpc_transaction_sync,
+        chain,
+        tx_hash,
+        requested_amount,
+    )
+
+
+# ================================================================
+# BINANCE DEPOSIT HISTORY
+# ================================================================
+
+def _fetch_binance_deposits_sync(
+    binance_network: str,
+) -> list[dict]:
+
     client = _get_binance_client()
+
     if client is None:
         return []
 
-    end_time = int(time_module.time() * 1000)
-    start_time = end_time - BINANCE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    end_time = int(
+        time_module.time() * 1000
+    )
+
+    # Keep Binance request window reasonably small.
+    start_time = (
+        end_time
+        - BINANCE_LOOKBACK_DAYS
+        * 24
+        * 60
+        * 60
+        * 1000
+    )
+
     all_deposits = []
 
     for coin in DEPOSIT_COINS:
+
         try:
+
             deposits = client.get_deposit_history(
-                coin=coin, network=binance_network,
-                startTime=start_time, endTime=end_time,
+                coin=coin,
+                network=binance_network,
+                startTime=start_time,
+                endTime=end_time,
             ) or []
-            for d in deposits:
-                d["_coin"] = coin
-            all_deposits.extend(deposits)
-        except BinanceAPIException as e:
-            if "Timestamp" in str(e):
-                global _binance_client
-                _binance_client = None
-            logger.warning("API error %s/%s: %s", coin, binance_network, e)
-        except Exception as e:
-            logger.warning("Error %s/%s: %s", coin, binance_network, e)
+
+            for row in deposits:
+                row["_coin"] = coin
+
+            all_deposits.extend(
+                deposits
+            )
+
+        except BinanceAPIException as exc:
+
+            logger.warning(
+                "Binance API error %s/%s: %s",
+                coin,
+                binance_network,
+                exc,
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "Binance request error %s/%s: %s",
+                coin,
+                binance_network,
+                exc,
+            )
 
     return all_deposits
 
 
-async def _fetch_binance_matches(chain: Chain) -> dict[str, dict]:
+async def _fetch_binance_matches(
+    chain: Chain,
+) -> dict[str, dict]:
+
     if not chain.binance_network:
         return {}
-    rows = await asyncio.to_thread(_fetch_binance_deposits_sync, chain.binance_network)
-    return {(row.get("txId") or "").lower(): row for row in rows if row.get("txId")}
+
+    rows = await asyncio.to_thread(
+        _fetch_binance_deposits_sync,
+        chain.binance_network,
+    )
+
+    result = {}
+
+    for row in rows:
+
+        tx_id = (
+            row.get("txId")
+            or row.get("txid")
+            or ""
+        ).lower()
+
+        if tx_id:
+            result[tx_id] = row
+
+    return result
 
 
-def _match_binance_row(chain: Chain, tx_hash: str, matches: dict[str, dict],
-                       deposit_created_at=None, requested_amount=None):
-    row = matches.get(tx_hash.lower())
+# ================================================================
+# BINANCE MATCH
+# ================================================================
+
+def _match_binance_row(
+    chain: Chain,
+    tx_hash: str,
+    matches: dict[str, dict],
+    rpc_result: dict,
+):
+    row = matches.get(
+        tx_hash.lower()
+    )
+
     if row is None:
         return None
 
-    coin = row.get("_coin", _get_coin_from_row(row))
+    # ------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------
 
     try:
-        status = int(row.get("status", -1))
-    except:
+        status = int(
+            row.get("status", -1)
+        )
+    except Exception:
         status = -1
-    if status != BINANCE_CONFIRMED_STATUS:
+
+    if status != 1:
+
+        logger.info(
+            "[%s] Binance deposit not successful yet | tx=%s",
+            chain.name,
+            tx_hash[:18],
+        )
+
         return None
 
-    address = (row.get("address") or "").lower()
-    if chain.address and address and address != chain.address:
-        logger.warning("[%s] ADDR MISMATCH: got=%s", chain.name, address[:16])
+    # ------------------------------------------------------------
+    # Coin
+    # ------------------------------------------------------------
+
+    binance_coin = str(
+        row.get("_coin")
+        or row.get("coin")
+        or row.get("asset")
+        or ""
+    ).upper()
+
+    rpc_coin = str(
+        rpc_result.get("coin")
+        or ""
+    ).upper()
+
+    if binance_coin != rpc_coin:
+
+        logger.warning(
+            "[%s] COIN MISMATCH | Binance=%s RPC=%s",
+            chain.name,
+            binance_coin,
+            rpc_coin,
+        )
+
         return False
 
-    results = _verify_all_layers(chain, row, tx_hash, coin, deposit_created_at, requested_amount)
+    # ------------------------------------------------------------
+    # Network
+    # ------------------------------------------------------------
 
-    statuses = []
-    for r in results:
-        icon = "✓" if r.passed else "✗"
-        statuses.append(f"{icon}{r.layer}")
-    logger.info("[%s] %s | tx=%s coin=%s", chain.name, " ".join(statuses), tx_hash[:16], coin)
+    row_network = str(
+        row.get("network")
+        or ""
+    ).upper()
 
-    for r in results:
-        if not r.passed:
-            if r.details.get("retry"):
-                return None
-            return False
+    expected_network = str(
+        chain.binance_network
+        or ""
+    ).upper()
+
+    if (
+        row_network
+        and expected_network
+        and row_network != expected_network
+    ):
+
+        logger.warning(
+            "[%s] NETWORK MISMATCH | Binance=%s expected=%s",
+            chain.name,
+            row_network,
+            expected_network,
+        )
+
+        return False
+
+    # ------------------------------------------------------------
+    # Address
+    # ------------------------------------------------------------
+
+    binance_address = str(
+        row.get("address")
+        or ""
+    ).lower()
+
+    expected_address = (
+        chain.address or ""
+    ).lower()
+
+    if (
+        binance_address
+        and expected_address
+        and binance_address != expected_address
+    ):
+
+        logger.warning(
+            "[%s] ADDRESS MISMATCH",
+            chain.name,
+        )
+
+        return False
+
+    # ------------------------------------------------------------
+    # Amount
+    # ------------------------------------------------------------
 
     try:
-        amount = Decimal(str(row.get("amount", "0")))
-    except:
+
+        binance_amount = Decimal(
+            str(
+                row.get(
+                    "amount",
+                    "0",
+                )
+            )
+        )
+
+    except Exception:
+
         return False
 
+    rpc_amount = Decimal(
+        str(
+            rpc_result["amount"]
+        )
+    )
+
+    if abs(
+        binance_amount
+        - rpc_amount
+    ) > AMOUNT_TOLERANCE:
+
+        logger.warning(
+            "[%s] AMOUNT MISMATCH | Binance=%s RPC=%s",
+            chain.name,
+            binance_amount,
+            rpc_amount,
+        )
+
+        return False
+
+    # ------------------------------------------------------------
+    # Everything matches
+    # ------------------------------------------------------------
+
+    logger.info(
+        "[%s] BINANCE VERIFIED | tx=%s | coin=%s | amount=%s",
+        chain.name,
+        tx_hash[:18],
+        rpc_coin,
+        rpc_amount,
+    )
+
     return {
-        "sender": "BINANCE", "receiver": address, "amount": amount,
-        "coin": coin, "network": row.get("network", chain.binance_network),
-        "verified_by": [r.layer for r in results],
+        "binance_verified": True,
+        "binance_status": status,
+        "binance_amount": binance_amount,
+        "binance_coin": binance_coin,
+        "binance_network": row_network,
+        "binance_address": binance_address,
+        "insert_time": row.get("insertTime"),
     }
 
 
-async def verify_transaction(chain: Chain, tx_hash: str,
-                             deposit_created_at=None, requested_amount=None):
-    if not chain.binance_network:
+# ================================================================
+# HYBRID VERIFICATION
+# ================================================================
+
+async def verify_transaction(
+    chain: Chain,
+    tx_hash: str,
+    requested_amount: Optional[Decimal] = None,
+):
+    """
+    HYBRID:
+
+        RPC
+          +
+        Binance
+
+    RPC must first prove the transaction exists and is valid.
+
+    Binance must then confirm the deposit.
+
+    Confirmations are ALWAYS calculated from RPC.
+    """
+
+    if not valid_hash(tx_hash):
+        return False
+
+    # ------------------------------------------------------------
+    # STEP 1 - RPC
+    # ------------------------------------------------------------
+
+    rpc_result = await verify_rpc_transaction(
+        chain,
+        tx_hash,
+        requested_amount,
+    )
+
+    if rpc_result is None:
         return None
-    matches = await _fetch_binance_matches(chain)
-    return _match_binance_row(chain, tx_hash, matches, deposit_created_at, requested_amount)
+
+    if rpc_result is False:
+        return False
+
+    # ------------------------------------------------------------
+    # STEP 2 - Confirmation
+    # ------------------------------------------------------------
+
+    if not rpc_result["confirmed"]:
+
+        logger.info(
+            "[%s] Waiting confirmations | %s/%s",
+            chain.name,
+            rpc_result["confirmations"],
+            rpc_result[
+                "required_confirmations"
+            ],
+        )
+
+        return None
+
+    # ------------------------------------------------------------
+    # STEP 3 - Binance
+    # ------------------------------------------------------------
+
+    matches = await _fetch_binance_matches(
+        chain
+    )
+
+    binance_result = _match_binance_row(
+        chain,
+        tx_hash,
+        matches,
+        rpc_result,
+    )
+
+    if binance_result is None:
+
+        logger.info(
+            "[%s] RPC valid but Binance deposit "
+            "not available yet | tx=%s",
+            chain.name,
+            tx_hash[:18],
+        )
+
+        return None
+
+    if binance_result is False:
+        return False
+
+    # ------------------------------------------------------------
+    # FINAL RESULT
+    # ------------------------------------------------------------
+
+    return {
+        "sender": rpc_result["sender"],
+        "receiver": rpc_result["receiver"],
+        "amount": rpc_result["amount"],
+        "coin": rpc_result["coin"],
+        "network": rpc_result["network"],
+        "contract": rpc_result["contract"],
+        "block_number": rpc_result["block_number"],
+        "confirmations": rpc_result["confirmations"],
+        "required_confirmations": (
+            rpc_result[
+                "required_confirmations"
+            ]
+        ),
+        "rpc_verified": True,
+        "binance_verified": True,
+        "verified_by": [
+            "RPC_TRANSACTION",
+            "RPC_TOKEN_CONTRACT",
+            "RPC_RECIPIENT",
+            "RPC_AMOUNT",
+            "RPC_CONFIRMATIONS",
+            "BINANCE_DEPOSIT",
+        ],
+    }
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  BINANCE PAY                                               ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-def _sapi_sign(params: dict, secret: str) -> str:
-    return hmac.new(secret.encode(),
-        "&".join(f"{k}={v}" for k, v in params.items()).encode(),
-        hashlib.sha256).hexdigest()
-
-
-def _query_pay_trade_history_sync(lookback_days: int) -> list[dict]:
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return []
-    client = _get_binance_client()
-    if client is None:
-        return []
-    try:
-        server_time = client.get_server_time()["serverTime"]
-    except:
-        return []
-    end_time = server_time
-    start_time = end_time - lookback_days * 24 * 60 * 60 * 1000
-    params = {"startTime": start_time, "endTime": end_time,
-              "recvWindow": 5000, "timestamp": server_time}
-    params["signature"] = _sapi_sign(params, BINANCE_API_SECRET)
-    try:
-        resp = requests.get(PAY_TRANSACTIONS_URL,
-                            headers={"X-MBX-APIKEY": BINANCE_API_KEY},
-                            params=params, timeout=15)
-        if resp.status_code != 200: return []
-        payload = resp.json()
-        rows = payload.get("data", [])
-        return rows if isinstance(rows, list) else []
-    except:
-        return []
-
-
-def _match_pay_transaction(order_id: str, rows: list[dict]) -> Optional[dict]:
-    for row in rows:
-        matched = any(str(row.get(f)) == str(order_id)
-                     for f in PAY_TRANSACTION_MATCH_FIELDS if row.get(f) is not None)
-        if not matched: continue
-        try:
-            if Decimal(str(row.get("amount", "0"))) > 0:
-                return row
-        except: pass
-    return None
-
-
-async def verify_binance_pay_order(order_id: str) -> Optional[Union[dict, bool]]:
-    rows = await asyncio.to_thread(_query_pay_trade_history_sync, BINANCE_PAY_LOOKBACK_DAYS)
-    match = _match_pay_transaction(order_id, rows)
-    if match:
-        currency = str(match.get("currency", "")).upper()
-        if currency not in [c.upper() for c in BINANCE_PAY_ACCEPTED_CURRENCIES]:
-            return False
-        return {"sender": "BINANCE_PAY", "receiver": "",
-                "amount": Decimal(str(match.get("amount", "0"))).copy_abs(),
-                "currency": currency, "order_id": order_id}
-    return None
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  UPI                                                       ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-def valid_utr(utr: str) -> bool:
-    return bool(UTR_RE.match(utr) or TXN_ID_RE.match(utr)) if isinstance(utr, str) else False
-
+# ================================================================
+# UPI HELPERS
+# ================================================================
 
 def _decode_text(text) -> str:
-    if text is None: return ""
+
+    if text is None:
+        return ""
+
     result = ""
+
     for value, encoding in decode_header(text):
-        result += value.decode(encoding or "utf-8", errors="ignore") if isinstance(value, bytes) else value
+
+        if isinstance(value, bytes):
+
+            result += value.decode(
+                encoding or "utf-8",
+                errors="ignore",
+            )
+
+        else:
+
+            result += value
+
     return result
 
 
 def _get_body(msg) -> str:
+
     if msg.is_multipart():
+
         for part in msg.walk():
-            if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition")):
-                payload = part.get_payload(decode=True)
-                if payload: return payload.decode(errors="ignore")
+
+            if (
+                part.get_content_type()
+                == "text/plain"
+                and "attachment"
+                not in str(
+                    part.get(
+                        "Content-Disposition"
+                    )
+                )
+            ):
+
+                payload = part.get_payload(
+                    decode=True
+                )
+
+                if payload:
+
+                    return payload.decode(
+                        errors="ignore"
+                    )
+
         return ""
-    payload = msg.get_payload(decode=True)
-    return payload.decode(errors="ignore") if payload else ""
+
+    payload = msg.get_payload(
+        decode=True
+    )
+
+    return (
+        payload.decode(errors="ignore")
+        if payload
+        else ""
+    )
 
 
-def _extract_upi_identifiers(text: str) -> dict:
-    result = {"utr": None, "txn_id": None, "amount": None}
-    if not text: return result
-    utr_match = UTR_SPECIFIC_RE.search(text)
-    if utr_match: result["utr"] = utr_match.group(1)
-    txn_match = TXN_ID_SPECIFIC_RE.search(text)
-    if txn_match: result["txn_id"] = txn_match.group(1)
-    if not result["utr"]:
-        fallback = UTR_FALLBACK_RE.search(text)
-        if fallback and fallback.group(1) != result["txn_id"]:
-            result["utr"] = fallback.group(1)
-    if not result["txn_id"]:
-        fallback = TXN_ID_FALLBACK_RE.search(text)
-        if fallback and fallback.group(1) != result["utr"]:
-            result["txn_id"] = fallback.group(1)
-    pos = utr_match.start() if utr_match else (txn_match.start() if txn_match else None)
-    amt = _extract_amount(text, pos)
-    if amt is not None: result["amount"] = amt
-    return result
+def _extract_amount(
+    text: str,
+    near_pos: Optional[int] = None,
+):
 
+    if not text:
+        return None
 
-def _extract_amount(text: str, near_pos: Optional[int] = None) -> Optional[Decimal]:
-    if not text: return None
-    def td(raw):
-        try: return Decimal(raw.replace(",", ""))
-        except InvalidOperation: return None
-    rm = list(RECEIVED_AMOUNT_RE.finditer(text))
-    if rm:
+    def to_decimal(raw):
+
+        try:
+            return Decimal(
+                raw.replace(",", "")
+            )
+
+        except InvalidOperation:
+            return None
+
+    matches = list(
+        RECEIVED_AMOUNT_RE.finditer(text)
+    )
+
+    if matches:
+
         if near_pos is not None:
-            best = min(rm, key=lambda m: abs(m.start(1) - near_pos))
-            v = td(best.group(1))
-            if v is not None: return v
-        v = td(rm[0].group(1))
-        if v is not None: return v
-    am = list(AMOUNT_RE.finditer(text))
-    if am:
+
+            best = min(
+                matches,
+                key=lambda m: abs(
+                    m.start(1)
+                    - near_pos
+                ),
+            )
+
+            value = to_decimal(
+                best.group(1)
+            )
+
+            if value is not None:
+                return value
+
+        value = to_decimal(
+            matches[0].group(1)
+        )
+
+        if value is not None:
+            return value
+
+    matches = list(
+        AMOUNT_RE.finditer(text)
+    )
+
+    if matches:
+
         if near_pos is not None:
-            best = min(am, key=lambda m: abs(m.start() - near_pos))
-            v = td(best.group(1))
-            if v is not None: return v
-        return td(am[0].group(1))
+
+            best = min(
+                matches,
+                key=lambda m: abs(
+                    m.start()
+                    - near_pos
+                ),
+            )
+
+            value = to_decimal(
+                best.group(1)
+            )
+
+            if value is not None:
+                return value
+
+        return to_decimal(
+            matches[0].group(1)
+        )
+
     return None
 
 
+def _extract_upi_identifiers(
+    text: str,
+) -> dict:
+
+    result = {
+        "utr": None,
+        "txn_id": None,
+        "amount": None,
+    }
+
+    if not text:
+        return result
+
+    utr_match = UTR_SPECIFIC_RE.search(
+        text
+    )
+
+    if utr_match:
+        result["utr"] = (
+            utr_match.group(1)
+        )
+
+    txn_match = TXN_ID_SPECIFIC_RE.search(
+        text
+    )
+
+    if txn_match:
+        result["txn_id"] = (
+            txn_match.group(1)
+        )
+
+    if not result["utr"]:
+
+        fallback = UTR_FALLBACK_RE.search(
+            text
+        )
+
+        if fallback:
+            result["utr"] = (
+                fallback.group(1)
+            )
+
+    if not result["txn_id"]:
+
+        fallback = TXN_ID_FALLBACK_RE.search(
+            text
+        )
+
+        if fallback:
+            result["txn_id"] = (
+                fallback.group(1)
+            )
+
+    pos = (
+        utr_match.start()
+        if utr_match
+        else (
+            txn_match.start()
+            if txn_match
+            else None
+        )
+    )
+
+    result["amount"] = _extract_amount(
+        text,
+        pos,
+    )
+
+    return result
+
+
 def _fetch_famapp_matches() -> dict:
-    if not IMAP_EMAIL or not IMAP_APP_PASSWORD or not FAMAPP_SENDER_EMAIL:
+
+    if (
+        not IMAP_EMAIL
+        or not IMAP_APP_PASSWORD
+        or not FAMAPP_SENDER_EMAIL
+    ):
         return {}
-    matches, mail = {}, None
+
+    matches = {}
+    mail = None
+
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST)
-        mail.login(IMAP_EMAIL, IMAP_APP_PASSWORD)
+
+        mail = imaplib.IMAP4_SSL(
+            IMAP_HOST
+        )
+
+        mail.login(
+            IMAP_EMAIL,
+            IMAP_APP_PASSWORD,
+        )
+
         mail.select("INBOX")
-        since = (datetime.now() - timedelta(days=IMAP_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
-        status, data = mail.search(None, f'(FROM "{FAMAPP_SENDER_EMAIL}" SINCE {since})')
-        if status != "OK": return {}
-        ids = data[0].split()[-MAX_EMAILS_TO_SCAN:]
-        if not ids: return {}
-        status, msg_data = mail.fetch(b",".join(ids), "(RFC822)")
-        if status != "OK" or not msg_data: return {}
+
+        since = (
+            datetime.now()
+            - timedelta(
+                days=IMAP_LOOKBACK_DAYS
+            )
+        ).strftime("%d-%b-%Y")
+
+        status, data = mail.search(
+            None,
+            f'(FROM "{FAMAPP_SENDER_EMAIL}" '
+            f'SINCE {since})',
+        )
+
+        if status != "OK":
+            return {}
+
+        ids = data[0].split()
+
+        ids = ids[
+            -MAX_EMAILS_TO_SCAN:
+        ]
+
+        if not ids:
+            return {}
+
+        status, msg_data = mail.fetch(
+            b",".join(ids),
+            "(RFC822)",
+        )
+
+        if status != "OK":
+            return {}
+
         for item in msg_data:
-            if not isinstance(item, tuple): continue
-            msg = email.message_from_bytes(item[1])
-            full = f"{_decode_text(msg.get('Subject'))}\n{_get_body(msg)}"
-            ids_dict = _extract_upi_identifiers(full)
-            if ids_dict["amount"] is None: continue
-            utr, txn_id = ids_dict["utr"], ids_dict["txn_id"]
-            if not utr and not txn_id: continue
-            payment_info = {"amount": ids_dict["amount"], "utr": utr, "txn_id": txn_id}
-            if utr: matches[utr.upper()] = payment_info
-            if txn_id: matches[txn_id.upper()] = payment_info
+
+            if not isinstance(
+                item,
+                tuple,
+            ):
+                continue
+
+            msg = email.message_from_bytes(
+                item[1]
+            )
+
+            full = (
+                f"{_decode_text(msg.get('Subject'))}\n"
+                f"{_get_body(msg)}"
+            )
+
+            data = _extract_upi_identifiers(
+                full
+            )
+
+            if data["amount"] is None:
+                continue
+
+            utr = data["utr"]
+            txn_id = data["txn_id"]
+
+            if not utr and not txn_id:
+                continue
+
+            payment = {
+                "amount": data["amount"],
+                "utr": utr,
+                "txn_id": txn_id,
+            }
+
+            if utr:
+                matches[
+                    utr.upper()
+                ] = payment
+
+            if txn_id:
+                matches[
+                    txn_id.upper()
+                ] = payment
+
         return matches
+
     except Exception:
-        logger.exception("UPI IMAP failed")
+
+        logger.exception(
+            "UPI IMAP failed"
+        )
+
         return {}
+
     finally:
+
         if mail:
-            try: mail.logout()
-            except: pass
+
+            try:
+                mail.logout()
+            except Exception:
+                pass
 
 
-def _match_upi(deposit: Deposit, matches: dict) -> Optional[Union[dict, bool]]:
-    user_input = (deposit.tx_hash or "").strip()
-    if not valid_utr(user_input): return False
-    payment_info = matches.get(user_input.upper())
-    if payment_info is None: return None
-    return {"sender": "UPI", "receiver": UPI_ID,
-            "inr_amount": payment_info["amount"],
-            "amount": payment_info["amount"],
-            "utr": payment_info.get("utr") or user_input,
-            "txn_id": payment_info.get("txn_id")}
+def _match_upi(
+    deposit: Deposit,
+    matches: dict,
+):
+
+    user_input = (
+        deposit.tx_hash or ""
+    ).strip()
+
+    if not valid_utr(user_input):
+        return False
+
+    payment = matches.get(
+        user_input.upper()
+    )
+
+    if payment is None:
+        return None
+
+    return {
+        "sender": "UPI",
+        "receiver": UPI_ID,
+        "amount": payment["amount"],
+        "inr_amount": payment["amount"],
+        "utr": (
+            payment.get("utr")
+            or user_input
+        ),
+        "txn_id": payment.get(
+            "txn_id"
+        ),
+    }
 
 
-async def verify_upi(deposit: Deposit) -> Optional[Union[dict, bool]]:
+async def verify_upi(
+    deposit: Deposit,
+):
+
     try:
-        return _match_upi(deposit, await asyncio.to_thread(_fetch_famapp_matches))
-    except:
+
+        matches = await asyncio.to_thread(
+            _fetch_famapp_matches
+        )
+
+        return _match_upi(
+            deposit,
+            matches,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "UPI verification failed"
+        )
+
         return None
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  INR CONVERSION                                            ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# BINANCE PAY
+# ================================================================
 
-_usdt_inr_rate_cache: dict = {"rate": None, "last_updated": None, "ttl_seconds": 300}
+def _sapi_sign(
+    params: dict,
+    secret: str,
+) -> str:
+
+    query = "&".join(
+        f"{k}={v}"
+        for k, v in params.items()
+    )
+
+    return hmac.new(
+        secret.encode(),
+        query.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _query_pay_trade_history_sync(
+    lookback_days: int,
+):
+
+    if (
+        not BINANCE_API_KEY
+        or not BINANCE_API_SECRET
+    ):
+        return []
+
+    client = _get_binance_client()
+
+    if client is None:
+        return []
+
+    try:
+
+        server_time = client.get_server_time()[
+            "serverTime"
+        ]
+
+    except Exception:
+
+        return []
+
+    end_time = server_time
+
+    start_time = (
+        end_time
+        - lookback_days
+        * 24
+        * 60
+        * 60
+        * 1000
+    )
+
+    params = {
+        "startTime": start_time,
+        "endTime": end_time,
+        "recvWindow": 5000,
+        "timestamp": server_time,
+    }
+
+    params["signature"] = _sapi_sign(
+        params,
+        BINANCE_API_SECRET,
+    )
+
+    try:
+
+        response = requests.get(
+            PAY_TRANSACTIONS_URL,
+            headers={
+                "X-MBX-APIKEY":
+                    BINANCE_API_KEY
+            },
+            params=params,
+            timeout=15,
+        )
+
+        if response.status_code != 200:
+            return []
+
+        payload = response.json()
+
+        rows = payload.get(
+            "data",
+            [],
+        )
+
+        return (
+            rows
+            if isinstance(rows, list)
+            else []
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Binance Pay request failed"
+        )
+
+        return []
+
+
+def _match_pay_transaction(
+    order_id: str,
+    rows: list[dict],
+):
+
+    for row in rows:
+
+        matched = any(
+            str(
+                row.get(field)
+            )
+            == str(order_id)
+            for field in PAY_TRANSACTION_MATCH_FIELDS
+            if row.get(field)
+            is not None
+        )
+
+        if not matched:
+            continue
+
+        try:
+
+            amount = Decimal(
+                str(
+                    row.get(
+                        "amount",
+                        "0",
+                    )
+                )
+            )
+
+            if amount > 0:
+                return row
+
+        except Exception:
+            continue
+
+    return None
+
+
+async def verify_binance_pay_order(
+    order_id: str,
+):
+
+    rows = await asyncio.to_thread(
+        _query_pay_trade_history_sync,
+        BINANCE_PAY_LOOKBACK_DAYS,
+    )
+
+    match = _match_pay_transaction(
+        order_id,
+        rows,
+    )
+
+    if not match:
+        return None
+
+    currency = str(
+        match.get(
+            "currency",
+            "",
+        )
+    ).upper()
+
+    accepted = {
+        str(x).upper()
+        for x in BINANCE_PAY_ACCEPTED_CURRENCIES
+    }
+
+    if currency not in accepted:
+        return False
+
+    return {
+        "sender": "BINANCE_PAY",
+        "receiver": "",
+        "amount": Decimal(
+            str(
+                match.get(
+                    "amount",
+                    "0",
+                )
+            )
+        ).copy_abs(),
+        "currency": currency,
+        "order_id": order_id,
+    }
+
+
+# ================================================================
+# INR / UPI CONVERSION (CurrencyAPI Multi-Key Integration)
+# ================================================================
+
+_usdt_inr_rate_cache = {
+    "rate": None,
+    "last_updated": None,
+    "ttl_seconds": 1200,  # Matches CURRENCY_RATE_CACHE_MINUTES (20 mins)
+}
+
+_current_api_key_index = 0
 
 def _get_usdt_inr_rate() -> Decimal:
+    global _current_api_key_index
     now = time_module.time()
-    if (_usdt_inr_rate_cache["rate"] is not None
-            and _usdt_inr_rate_cache["last_updated"] is not None
-            and (now - _usdt_inr_rate_cache["last_updated"]) < _usdt_inr_rate_cache["ttl_seconds"]):
-        return _usdt_inr_rate_cache["rate"]
+    cache = _usdt_inr_rate_cache
+
+    if (
+        cache["rate"] is not None
+        and cache["last_updated"] is not None
+        and (now - cache["last_updated"]) < cache["ttl_seconds"]
+    ):
+        return cache["rate"]
+
+    api_keys = getattr(config, "CURRENCY_API_KEYS", [])
+    base_url = getattr(config, "CURRENCY_API_URL", "https://api.currencyapi.com/v3/latest")
+    
+    # Try CurrencyAPI keys first if available
+    if api_keys:
+        num_keys = len(api_keys)
+        for _ in range(num_keys):
+            current_key = api_keys[_current_api_key_index]
+            try:
+                response = requests.get(
+                    base_url,
+                    params={
+                        "apikey": current_key,
+                        "base_currency": "USD",
+                        "currencies": "INR"
+                    },
+                    timeout=getattr(config, "CURRENCY_REQUEST_TIMEOUT", 10)
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    inr_data = data.get("data", {}).get("INR", {})
+                    rate_val = inr_data.get("value")
+                    
+                    if rate_val:
+                        rate = Decimal(str(rate_val))
+                        if rate > 0:
+                            cache["rate"] = rate
+                            cache["last_updated"] = now
+                            return rate
+                elif response.status_code in (401, 403, 429) and getattr(config, "CURRENCY_ROTATE_KEYS_ON_ERROR", True):
+                    _current_api_key_index = (_current_api_key_index + 1) % num_keys
+            except Exception:
+                pass
+            
+            if getattr(config, "CURRENCY_ROTATE_KEYS_ON_ERROR", True):
+                _current_api_key_index = (_current_api_key_index + 1) % num_keys
+
+    # Fallback to Binance ticker if CurrencyAPI fails
     client = _get_binance_client()
     if client is not None:
         try:
             rate = Decimal(str(client.get_symbol_ticker(symbol="USDTINR")["price"]))
-            _usdt_inr_rate_cache["rate"] = rate
-            _usdt_inr_rate_cache["last_updated"] = now
-            return rate
-        except: pass
-        try:
-            btc_inr = Decimal(str(client.get_symbol_ticker(symbol="BTCINR")["price"]))
-            btc_usdt = Decimal(str(client.get_symbol_ticker(symbol="BTCUSDT")["price"]))
-            if btc_inr > 0 and btc_usdt > 0:
-                rate = (btc_inr / btc_usdt).quantize(Decimal("0.01"))
-                _usdt_inr_rate_cache["rate"] = rate
-                _usdt_inr_rate_cache["last_updated"] = now
+            if rate > 0:
+                cache["rate"] = rate
+                cache["last_updated"] = now
                 return rate
-        except: pass
+        except Exception:
+            pass
+
     return Decimal(str(getattr(config, "UPI_USDT_INR_RATE", 95.0)))
 
-def convert_inr_to_usdt(inr_amount: Decimal) -> Decimal:
-    rate = _get_usdt_inr_rate()
-    return (inr_amount / rate).quantize(Decimal("0.000001")) if rate > 0 else Decimal("0")
+
+def convert_inr_to_usdt(
+    inr_amount: Decimal,
+    rate: Optional[Decimal] = None,
+) -> Decimal:
+    """Convert INR using one verified rate snapshot and retain accounting precision."""
+    rate = rate if rate is not None else _get_usdt_inr_rate()
+    if rate <= 0:
+        return Decimal("0")
+
+    return (inr_amount / rate).quantize(
+        Decimal("0.00000001"),
+        rounding=ROUND_HALF_UP,
+    )
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  CREDIT USER                                               ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# CREDIT USER
+# ================================================================
 
-def credit_user(db, deposit: Deposit, credited_amount: Decimal,
-                requested_amount: Decimal, inr_amount=None, usdt_inr_rate=None) -> bool:
-    user = db.query(User).filter(User.telegram_id == deposit.telegram_id).first()
-    if user is None: return False
-    user.balance += Decimal(str(credited_amount))
-    if hasattr(user, "total_deposit"):
-        user.total_deposit += float(credited_amount)
-    deposit.amount = float(credited_amount)
+def credit_user(
+    db,
+    deposit: Deposit,
+    credited_amount: Decimal,
+    requested_amount: Optional[Decimal],
+    inr_amount=None,
+    usdt_inr_rate=None,
+) -> bool:
+
+    user = (
+        db.query(User)
+        .filter(
+            User.telegram_id
+            == deposit.telegram_id
+        )
+        .first()
+    )
+
+    if user is None:
+        return False
+
+    # ------------------------------------------------------------
+    # Final duplicate protection
+    # ------------------------------------------------------------
+
+    existing = (
+        db.query(Deposit)
+        .filter(
+            Deposit.tx_hash
+            == deposit.tx_hash,
+            Deposit.status
+            == "completed",
+            Deposit.id
+            != deposit.id,
+        )
+        .first()
+    )
+
+    if existing:
+        logger.warning(
+            "Duplicate TX prevented | tx=%s",
+            deposit.tx_hash,
+        )
+
+        return False
+
+    # ------------------------------------------------------------
+    # Credit
+    # ------------------------------------------------------------
+
+    user.balance += Decimal(
+        str(credited_amount)
+    )
+
+    if hasattr(
+        user,
+        "total_deposit",
+    ):
+
+        user.total_deposit += float(
+            credited_amount
+        )
+
+    # Store Decimal values without passing through float, which prevents
+    # decimal precision loss in credited deposit records.
+    deposit.amount = credited_amount
+
     deposit.status = "completed"
-    if hasattr(deposit, 'received_amount'):
-        deposit.received_amount = float(credited_amount)
-    if inr_amount is not None and hasattr(deposit, 'inr_amount'):
-        deposit.inr_amount = float(inr_amount)
-    if usdt_inr_rate is not None and hasattr(deposit, 'conversion_rate'):
-        deposit.conversion_rate = float(usdt_inr_rate)
+
+    deposit.received_amount = credited_amount
+
+    if inr_amount is not None:
+        deposit.inr_amount = Decimal(str(inr_amount))
+
+    if usdt_inr_rate is not None:
+        deposit.conversion_rate = Decimal(str(usdt_inr_rate))
+
     db.commit()
-    logger.info("CREDITED | User=%s Amount=%s | Balance=%s",
-                user.telegram_id, credited_amount, user.balance)
+
+    logger.info(
+        "CREDITED | User=%s | Amount=%s | Balance=%s",
+        user.telegram_id,
+        credited_amount,
+        user.balance,
+    )
+
     return True
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  VERIFY ONE DEPOSIT                                        ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# ATTEMPTS
+# ================================================================
 
-async def verify_deposit(deposit_or_id, upi_matches=None,
-                         binance_matches=None, result_info=None):
-    db = SessionLocal()
+def _record_pending_attempt(
+    deposit_id: int,
+) -> int:
+
+    count = (
+        _check_attempts.get(
+            deposit_id,
+            0,
+        )
+        + 1
+    )
+
+    _check_attempts[
+        deposit_id
+    ] = count
+
+    return count
+
+
+def _clear_pending_attempts(
+    deposit_id: int,
+):
+
+    _check_attempts.pop(
+        deposit_id,
+        None,
+    )
+
+
+# ================================================================
+# FAILED DEPOSIT
+# ================================================================
+
+DELETE_FAILED_DEPOSITS = getattr(
+    config,
+    "DEPOSIT_DELETE_FAILED",
+    False,
+)
+
+
+def _finalize_failed(
+    db,
+    deposit: Deposit,
+    reason: str,
+):
+
+    if DELETE_FAILED_DEPOSITS:
+        db.delete(deposit)
+    else:
+        deposit.status = "failed"
+
+    db.commit()
+
+    logger.warning(
+        "Deposit %s FAILED: %s",
+        deposit.id,
+        reason,
+    )
+
+    _clear_pending_attempts(
+        deposit.id
+    )
+
+
+def _fail_deposit(
+    db,
+    deposit_id: int,
+    reason: str,
+):
+
     try:
-        deposit_id = deposit_or_id if isinstance(deposit_or_id, int) else deposit_or_id.id
+
+        dep = db.get(
+            Deposit,
+            deposit_id,
+        )
+
+        if (
+            dep
+            and dep.status
+            not in (
+                "completed",
+                "failed",
+            )
+        ):
+
+            _finalize_failed(
+                db,
+                dep,
+                reason,
+            )
+
+    except Exception:
+
+        db.rollback()
+
+    finally:
+
+        _clear_pending_attempts(
+            deposit_id
+        )
+
+
+# ================================================================
+# VERIFY ONE DEPOSIT
+# ================================================================
+
+async def verify_deposit(
+    deposit_or_id,
+    upi_matches=None,
+    result_info=None,
+):
+
+    db = SessionLocal()
+
+    try:
+
+        deposit_id = (
+            deposit_or_id
+            if isinstance(
+                deposit_or_id,
+                int,
+            )
+            else deposit_or_id.id
+        )
+
+        deposit = db.get(
+            Deposit,
+            deposit_id,
+        )
+
+        if deposit is None:
+
+            _clear_pending_attempts(
+                deposit_id
+            )
+
+            return False
+
+        # --------------------------------------------------------
+        # Already processed
+        # --------------------------------------------------------
+
+        if deposit.status in (
+            "completed",
+            "failed",
+        ):
+
+            _clear_pending_attempts(
+                deposit.id
+            )
+
+            return (
+                deposit.status
+                == "completed"
+            )
+
+        # --------------------------------------------------------
+        # Requested amount
+        # --------------------------------------------------------
+
+        try:
+
+            requested_amount = Decimal(
+                str(
+                    deposit.amount
+                )
+            )
+
+            if requested_amount <= 0:
+                requested_amount = None
+
+        except (
+            InvalidOperation,
+            TypeError,
+        ):
+
+            requested_amount = None
+
+        network = str(
+            deposit.network or ""
+        ).upper()
+
+        # ========================================================
+        # UPI
+        # ========================================================
+
+        if network == UPI_NETWORK:
+
+            if not valid_utr(
+                deposit.tx_hash or ""
+            ):
+
+                _fail_deposit(
+                    db,
+                    deposit.id,
+                    "invalid UTR",
+                )
+
+                return False
+
+            if upi_matches is not None:
+
+                verification = _match_upi(
+                    deposit,
+                    upi_matches,
+                )
+
+            else:
+                # Do not keep a pooled TiDB connection checked out while the
+                # IMAP/network verification is running. With a small pool this
+                # used to make unrelated commands wait for the pool timeout.
+                db.close()
+                db = None
+
+                verification = (
+                    await verify_upi(
+                        deposit
+                    )
+                )
+
+                db = SessionLocal()
+                deposit = db.get(Deposit, deposit_id)
+                if deposit is None:
+                    _clear_pending_attempts(deposit_id)
+                    return False
+                if deposit.status in ("completed", "failed"):
+                    _clear_pending_attempts(deposit.id)
+                    return deposit.status == "completed"
+
+            if verification is None:
+
+                _record_pending_attempt(
+                    deposit.id
+                )
+
+                return None
+
+            if verification is False:
+
+                _fail_deposit(
+                    db,
+                    deposit.id,
+                    "UPI verification failed",
+                )
+
+                return False
+
+            inr_amount = (
+                verification[
+                    "inr_amount"
+                ]
+            )
+
+            # Use exactly the same live INR/USDT rate for the credited amount,
+            # validation, and stored conversion record. Wallet accounting stays
+            # precise to eight decimals; only Telegram display is rounded.
+            rate = _get_usdt_inr_rate()
+
+            received_amount = (
+                convert_inr_to_usdt(
+                    inr_amount,
+                    rate,
+                )
+            )
+
+            if requested_amount is not None:
+
+                requested_usdt = (
+                    convert_inr_to_usdt(
+                        requested_amount,
+                        rate,
+                    )
+                )
+
+                if (
+                    received_amount
+                    < requested_usdt
+                    - AMOUNT_TOLERANCE
+                ):
+
+                    _fail_deposit(
+                        db,
+                        deposit.id,
+                        "UPI underpaid",
+                    )
+
+                    return False
+
+            _clear_pending_attempts(
+                deposit.id
+            )
+
+            return credit_user(
+                db,
+                deposit,
+                received_amount,
+                requested_amount,
+                inr_amount,
+                rate,
+            )
+
+        # ========================================================
+        # BINANCE PAY
+        # ========================================================
+
+        if network == BINANCE_PAY_NETWORK:
+
+            if not valid_order_id(
+                deposit.tx_hash or ""
+            ):
+
+                _fail_deposit(
+                    db,
+                    deposit.id,
+                    "invalid Binance Pay order ID",
+                )
+
+                return False
+
+            # Binance Pay is an external request. Release the connection
+            # before awaiting it, then reload the row before changing it.
+            db.close()
+            db = None
+
+            verification = (
+                await verify_binance_pay_order(
+                    deposit.tx_hash
+                )
+            )
+
+            db = SessionLocal()
+            deposit = db.get(Deposit, deposit_id)
+            if deposit is None:
+                _clear_pending_attempts(deposit_id)
+                return False
+            if deposit.status in ("completed", "failed"):
+                _clear_pending_attempts(deposit.id)
+                return deposit.status == "completed"
+
+            if verification is None:
+
+                _record_pending_attempt(
+                    deposit.id
+                )
+
+                return None
+
+            if verification is False:
+
+                _fail_deposit(
+                    db,
+                    deposit.id,
+                    "Binance Pay verification failed",
+                )
+
+                return False
+
+            received_amount = (
+                verification["amount"]
+            )
+
+            if requested_amount is not None:
+
+                if (
+                    received_amount
+                    < requested_amount
+                    - AMOUNT_TOLERANCE
+                ):
+
+                    _fail_deposit(
+                        db,
+                        deposit.id,
+                        "Binance Pay underpaid",
+                    )
+
+                    return False
+
+            _clear_pending_attempts(
+                deposit.id
+            )
+
+            return credit_user(
+                db,
+                deposit,
+                received_amount,
+                requested_amount,
+            )
+
+        # ========================================================
+        # CRYPTO
+        # ========================================================
+
+        if not valid_hash(
+            deposit.tx_hash or ""
+        ):
+
+            _fail_deposit(
+                db,
+                deposit.id,
+                "invalid transaction hash",
+            )
+
+            return False
+
+        if network not in CHAINS:
+
+            _fail_deposit(
+                db,
+                deposit.id,
+                f"unknown network {network}",
+            )
+
+            return False
+
+        chain = CHAINS[network]
+
+        # --------------------------------------------------------
+        # RPC + Binance
+        # --------------------------------------------------------
+
+        # RPC and Binance history checks can take many seconds. Holding a DB
+        # connection across this await starves command handlers under load.
+        db.close()
+        db = None
+
+        verification = (
+            await verify_transaction(
+                chain,
+                deposit.tx_hash,
+                requested_amount,
+            )
+        )
+
+        db = SessionLocal()
         deposit = db.get(Deposit, deposit_id)
         if deposit is None:
             _clear_pending_attempts(deposit_id)
             return False
         if deposit.status in ("completed", "failed"):
-            _clear_pending_attempts(deposit_id)
+            _clear_pending_attempts(deposit.id)
             return deposit.status == "completed"
 
-        try:
-            requested_amount = Decimal(str(deposit.amount))
-        except (InvalidOperation, TypeError):
-            requested_amount = None
-
-        network = deposit.network.upper() if deposit.network else ""
-        deposit_created_at = getattr(deposit, 'created_at', None) or getattr(deposit, 'timestamp', None)
-        upi_inr_amount, upi_rate = None, None
-
-        if network == UPI_NETWORK:
-            if not valid_utr(deposit.tx_hash or ""):
-                _fail_deposit(db, deposit.id, "invalid UTR")
-                return False
-            verification = _match_upi(deposit, upi_matches) if upi_matches else await verify_upi(deposit)
-            if verification and isinstance(verification, dict) and verification.get("sender") == "UPI":
-                upi_inr_amount = verification["inr_amount"]
-                upi_rate = _get_usdt_inr_rate()
-                verification["amount"] = convert_inr_to_usdt(upi_inr_amount)
-        elif network == BINANCE_PAY_NETWORK:
-            if not valid_order_id(deposit.tx_hash or ""):
-                _fail_deposit(db, deposit.id, "invalid order ID")
-                return False
-            verification = await verify_binance_pay_order(deposit.tx_hash)
-        else:
-            if not isinstance(deposit.tx_hash, str) or not valid_hash(deposit.tx_hash):
-                _fail_deposit(db, deposit.id, "invalid tx hash")
-                return False
-            if network not in CHAINS:
-                _fail_deposit(db, deposit.id, f"unknown network {network}")
-                return False
-            chain = CHAINS[network]
-            if binance_matches is not None:
-                verification = _match_binance_row(chain, deposit.tx_hash,
-                                                  binance_matches, deposit_created_at,
-                                                  requested_amount)
-            else:
-                verification = await verify_transaction(chain, deposit.tx_hash,
-                                                        deposit_created_at, requested_amount)
+        # --------------------------------------------------------
+        # Still pending
+        # --------------------------------------------------------
 
         if verification is None:
-            attempts = _record_pending_attempt(deposit.id)
-            if attempts >= MAX_CHECK_ATTEMPTS:
-                # After max attempts, check if deposit is > 60 seconds old
-                # If so, force-accept by rechecking without confirmation requirement
-                if deposit_created_at:
-                    age = (datetime.now() - deposit_created_at).total_seconds()
-                    if age > MAX_WAIT_SECONDS and network in CHAINS:
-                        logger.warning("Deposit %s expired after %s attempts but is %ss old — "
-                                     "forcing final check without confirmation requirement",
-                                     deposit.id, attempts, age)
-                        # Temporarily disable confirmation check for this final attempt
-                        global ENABLE_CONFIRMATION_CHECK
-                        old_setting = ENABLE_CONFIRMATION_CHECK
-                        ENABLE_CONFIRMATION_CHECK = False
-                        try:
-                            if binance_matches is not None:
-                                verification = _match_binance_row(
-                                    CHAINS[network], deposit.tx_hash, binance_matches,
-                                    deposit_created_at, requested_amount)
-                            else:
-                                verification = await verify_transaction(
-                                    CHAINS[network], deposit.tx_hash,
-                                    deposit_created_at, requested_amount)
-                        finally:
-                            ENABLE_CONFIRMATION_CHECK = old_setting
 
-                        if verification and isinstance(verification, dict):
-                            _clear_pending_attempts(deposit.id)
-                            received_amount = verification["amount"]
-                            return credit_user(db, deposit, received_amount,
-                                             requested_amount if requested_amount is not None else received_amount,
-                                             upi_inr_amount, upi_rate)
+            attempts = (
+                _record_pending_attempt(
+                    deposit.id
+                )
+            )
 
-                if result_info is not None: result_info["reason"] = "expired"
-                _finalize_failed(db, deposit, f"expired after {attempts} attempts")
-                return False
+            logger.info(
+                "[%s] Deposit %s still pending "
+                "(attempt %s/%s)",
+                network,
+                deposit.id,
+                attempts,
+                MAX_CHECK_ATTEMPTS,
+            )
+
+            if result_info is not None:
+                result_info[
+                    "reason"
+                ] = "pending"
+
             return None
 
-        _clear_pending_attempts(deposit.id)
+        # --------------------------------------------------------
+        # Permanently invalid
+        # --------------------------------------------------------
+
         if verification is False:
-            if result_info is not None: result_info["reason"] = "verification_failed"
-            _finalize_failed(db, deposit, "verification returned false")
+
+            if result_info is not None:
+                result_info[
+                    "reason"
+                ] = "verification_failed"
+
+            _finalize_failed(
+                db,
+                deposit,
+                "RPC/Binance verification failed",
+            )
+
             return False
 
-        dup = db.query(Deposit).filter(
-            Deposit.tx_hash == deposit.tx_hash,
-            Deposit.status == "completed",
-            Deposit.id != deposit.id
-        ).first()
-        if dup:
-            if result_info is not None: result_info["reason"] = "duplicate"
-            _finalize_failed(db, deposit, "duplicate")
-            return False
+        # --------------------------------------------------------
+        # Final amount verification
+        # --------------------------------------------------------
 
-        received_amount = verification["amount"]
+        received_amount = Decimal(
+            str(
+                verification[
+                    "amount"
+                ]
+            )
+        )
+
         if requested_amount is not None:
-            if network == UPI_NETWORK:
-                requested_usdt = convert_inr_to_usdt(requested_amount)
-                if received_amount < requested_usdt - AMOUNT_TOLERANCE:
-                    _finalize_failed(db, deposit, "underpaid")
-                    return False
-                requested_amount = requested_usdt
-            elif received_amount < requested_amount - AMOUNT_TOLERANCE:
-                _finalize_failed(db, deposit, "underpaid")
+
+            if (
+                received_amount
+                < requested_amount
+                - AMOUNT_TOLERANCE
+            ):
+
+                _finalize_failed(
+                    db,
+                    deposit,
+                    "underpaid",
+                )
+
                 return False
 
-        return credit_user(db, deposit, received_amount,
-                          requested_amount if requested_amount is not None else received_amount,
-                          upi_inr_amount, upi_rate)
+        # --------------------------------------------------------
+        # Final duplicate protection
+        # --------------------------------------------------------
+
+        duplicate = (
+            db.query(Deposit)
+            .filter(
+                Deposit.tx_hash
+                == deposit.tx_hash,
+                Deposit.status
+                == "completed",
+                Deposit.id
+                != deposit.id,
+            )
+            .first()
+        )
+
+        if duplicate:
+
+            _finalize_failed(
+                db,
+                deposit,
+                "duplicate transaction",
+            )
+
+            return False
+
+        # --------------------------------------------------------
+        # CREDIT
+        # --------------------------------------------------------
+
+        _clear_pending_attempts(
+            deposit.id
+        )
+
+        success = credit_user(
+            db,
+            deposit,
+            received_amount,
+            requested_amount,
+        )
+
+        if success:
+
+            logger.info(
+                "[%s] DEPOSIT VERIFIED + CREDITED | "
+                "tx=%s | coin=%s | amount=%s | "
+                "confirmations=%s/%s | "
+                "RPC=YES | BINANCE=YES",
+                network,
+                deposit.tx_hash[:18],
+                verification["coin"],
+                received_amount,
+                verification[
+                    "confirmations"
+                ],
+                verification[
+                    "required_confirmations"
+                ],
+            )
+
+        return success
+
     except Exception:
-        db.rollback()
-        logger.exception("Error verifying deposit")
+
+        if db is not None:
+            db.rollback()
+
+        logger.exception(
+            "Error verifying deposit"
+        )
+
         return False
+
     finally:
-        db.close()
+
+        if db is not None:
+            db.close()
 
 
-def _fail_deposit(db, deposit_id: int, reason: str) -> None:
-    try:
-        dep = db.get(Deposit, deposit_id)
-        if dep and dep.status not in ("completed", "failed"):
-            _finalize_failed(db, dep, reason)
-    except Exception:
-        db.rollback()
-    finally:
-        _clear_pending_attempts(deposit_id)
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  CHECK PENDING DEPOSITS                                    ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# CHECK PENDING DEPOSITS
+# ================================================================
 
 async def check_pending_deposits():
+
     db = SessionLocal()
+
     try:
-        rows = db.query(Deposit.id, Deposit.network).filter(Deposit.status == "pending").all()
+
+        rows = (
+            db.query(
+                Deposit.id,
+                Deposit.network,
+            )
+            .filter(
+                Deposit.status
+                == "pending"
+            )
+            .all()
+        )
+
     finally:
+
         db.close()
 
-    crypto_by_net, upi_ids, pay_ids = {}, [], []
-    for dep_id, network in rows:
-        net = (network or "").upper()
-        if net == UPI_NETWORK: upi_ids.append(dep_id)
-        elif net == BINANCE_PAY_NETWORK: pay_ids.append(dep_id)
-        elif net in CHAINS: crypto_by_net.setdefault(net, []).append(dep_id)
+    crypto_ids = []
+    pay_ids = []
+    upi_ids = []
 
-    logger.info("Checking %s pending (%s crypto, %s Pay, %s UPI)",
-                len(rows), sum(len(v) for v in crypto_by_net.values()),
-                len(pay_ids), len(upi_ids))
+    for deposit_id, network in rows:
 
-    for net, dep_ids in crypto_by_net.items():
+        network = str(
+            network or ""
+        ).upper()
+
+        if network in CHAINS:
+
+            crypto_ids.append(
+                deposit_id
+            )
+
+        elif network == BINANCE_PAY_NETWORK:
+
+            pay_ids.append(
+                deposit_id
+            )
+
+        elif network == UPI_NETWORK:
+
+            upi_ids.append(
+                deposit_id
+            )
+
+    logger.info(
+        "Checking %s pending | crypto=%s | "
+        "Binance Pay=%s | UPI=%s",
+        len(rows),
+        len(crypto_ids),
+        len(pay_ids),
+        len(upi_ids),
+    )
+
+    # ------------------------------------------------------------
+    # CRYPTO
+    # ------------------------------------------------------------
+
+    for deposit_id in crypto_ids:
+
         try:
-            matches = await _fetch_binance_matches(CHAINS[net])
-        except:
-            matches = {}
-        for did in dep_ids:
-            try:
-                await verify_deposit(did, binance_matches=matches)
-            except:
-                logger.exception("Failed deposit %s", did)
 
-    for did in pay_ids:
+            await verify_deposit(
+                deposit_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Crypto deposit %s failed",
+                deposit_id,
+            )
+
+    # ------------------------------------------------------------
+    # BINANCE PAY
+    # ------------------------------------------------------------
+
+    for deposit_id in pay_ids:
+
         try:
-            await verify_deposit(did)
-        except:
-            logger.exception("Failed Pay %s", did)
+
+            await verify_deposit(
+                deposit_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Binance Pay %s failed",
+                deposit_id,
+            )
+
+    # ------------------------------------------------------------
+    # UPI
+    # ------------------------------------------------------------
 
     if upi_ids:
+
         try:
-            um = await asyncio.to_thread(_fetch_famapp_matches)
-        except:
-            um = {}
-        for did in upi_ids:
+
+            upi_matches = await asyncio.to_thread(
+                _fetch_famapp_matches
+            )
+
+        except Exception:
+
+            upi_matches = {}
+
+        for deposit_id in upi_ids:
+
             try:
-                await verify_deposit(did, upi_matches=um)
-            except:
-                logger.exception("Failed UPI %s", did)
+
+                await verify_deposit(
+                    deposit_id,
+                    upi_matches=upi_matches,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "UPI deposit %s failed",
+                    deposit_id,
+                )
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  BACKGROUND LOOP                                           ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ================================================================
+# BACKGROUND LOOP
+# ================================================================
 
 async def deposit_checker_loop():
-    logger.info("=" * 55)
-    logger.info("DEPOSIT CHECKER — PROGRESSIVE CONFIRMATIONS")
-    logger.info("Coins: %s", ", ".join(DEPOSIT_COINS))
-    logger.info("Networks: %s", ", ".join(CHAINS.keys()))
-    logger.info("Max wait: %ss | Check: every %ss | Max attempts: %s",
-                MAX_WAIT_SECONDS, CHECK_INTERVAL, MAX_CHECK_ATTEMPTS)
-    logger.info("Tiers: BEP20=%s | POLYGON=%s",
-                NETWORK_CONFIRMATION_TIERS.get("BEP20"),
-                NETWORK_CONFIRMATION_TIERS.get("POLYGON"))
-    logger.info("=" * 55)
+
+    logger.info("=" * 65)
+
+    logger.info(
+        "HYBRID DEPOSIT CHECKER STARTED"
+    )
+
+    logger.info(
+        "Crypto verification: RPC + Binance"
+    )
+
+    logger.info(
+        "BSC confirmations: %s",
+        RPC_CONFIRMATIONS["BEP20"],
+    )
+
+    logger.info(
+        "Polygon confirmations: %s",
+        RPC_CONFIRMATIONS["POLYGON"],
+    )
+
+    logger.info(
+        "BSC RPCs: %s",
+        len(BSC_RPC_URLS),
+    )
+
+    logger.info(
+        "Polygon RPCs: %s",
+        len(POLYGON_RPC_URLS),
+    )
+
+    logger.info(
+        "Check interval: %ss",
+        CHECK_INTERVAL,
+    )
+
+    logger.info("=" * 65)
 
     while True:
+
         try:
+
             await check_pending_deposits()
+
         except Exception:
-            logger.exception("Checker crashed")
-        await asyncio.sleep(CHECK_INTERVAL)
+
+            logger.exception(
+                "Deposit checker crashed"
+            )
+
+        await asyncio.sleep(
+            CHECK_INTERVAL
+        )
 
 
 def start_checker():
-    return asyncio.create_task(deposit_checker_loop())
+
+    return asyncio.create_task(
+        deposit_checker_loop()
+    )

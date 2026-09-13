@@ -57,6 +57,13 @@ def get_admin_panel():
             ],
             [
                 InlineKeyboardButton(
+                    text="🏷 Custom Rates",
+                    callback_data="custom_rate_menu",
+                    style="primary"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅ Back",
                     callback_data="admin_back"
                 )

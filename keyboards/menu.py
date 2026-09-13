@@ -36,6 +36,12 @@ def get_main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🔑 API Access",
+                    callback_data="api_key_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="📞 Contact",
                     callback_data="contact_info"
                 )
@@ -75,6 +81,12 @@ def get_admin_main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🎫 Support",
                     callback_data="support_ticket"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔑 API Access",
+                    callback_data="api_key_menu"
                 )
             ],
             [

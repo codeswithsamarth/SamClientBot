@@ -21,7 +21,8 @@ from utils.ui import show, update_card
 
 router = Router()
 
-CONTACT_USERNAME = "@Popeye7707"
+# Store only the Telegram username, without @ or a t.me URL.
+CONTACT_USERNAME = "Senacoun"
 
 
 # =====================================================
@@ -536,7 +537,7 @@ async def rate_support(callback: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.startswith("rate_"))
+@router.callback_query(F.data.in_({"rate_1", "rate_2", "rate_3", "rate_4", "rate_5"}))
 async def handle_rating(callback: CallbackQuery):
     await callback.answer()
 

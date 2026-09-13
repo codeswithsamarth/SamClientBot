@@ -1,9 +1,11 @@
-# handlers/start.py — FULLY FIXED + MAX SPEED
+# handlers/start.py — FULLY FIXED + MAX SPEED + EXACT WALLET BALANCE
 
 import asyncio
 import logging
 import uuid
+from types import SimpleNamespace
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from html import escape as html_escape
 
 from aiogram import Router, F
@@ -102,11 +104,11 @@ def _status(balance: float) -> str:
 
 def _get_member_since(user) -> str:
     created = (
-        getattr(user, 'created_at', None) or
-        getattr(user, 'date_joined', None) or
-        getattr(user, 'created', None) or
-        getattr(user, 'joined_at', None) or
-        getattr(user, 'registered_at', None)
+            getattr(user, 'created_at', None) or
+            getattr(user, 'date_joined', None) or
+            getattr(user, 'created', None) or
+            getattr(user, 'joined_at', None) or
+            getattr(user, 'registered_at', None)
     )
     if created is not None and hasattr(created, 'strftime'):
         return created.strftime("%d %b %Y")
@@ -117,6 +119,16 @@ def generate_ref_code() -> str:
     return uuid.uuid4().hex[:8].upper()
 
 
+def _format_balance(raw_balance) -> str:
+    """Display wallet values with at most three decimal places."""
+    try:
+        dec_val = Decimal(str(raw_balance or 0))
+        rounded = dec_val.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        return format(rounded, "f").rstrip("0").rstrip(".") or "0"
+    except Exception:
+        return "0"
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  AUDIT-STYLE PROFILE BUILDER                               ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -125,7 +137,9 @@ def _build_audit_profile(user, telegram_id: int) -> str:
     """Terminal audit-style profile dashboard."""
     is_admin = telegram_id in ADMIN_IDS
     is_banned = bool(getattr(user, 'is_banned', False))
-    balance = float(getattr(user, 'balance_display', float(user.balance or 0)))
+    balance_raw = getattr(user, 'balance_display', getattr(user, 'balance', 0))
+    balance_str = _format_balance(balance_raw)
+
     ref_earnings = float(getattr(user, 'referral_earnings_display', 0))
     total_dep = float(getattr(user, 'total_deposited', 0) or 0)
     total_spent = float(getattr(user, 'total_spent', 0) or 0)
@@ -148,6 +162,11 @@ def _build_audit_profile(user, telegram_id: int) -> str:
     else:
         avg_order = "$0.00"
 
+    try:
+        numeric_bal = float(balance_raw or 0)
+    except Exception:
+        numeric_bal = 0.0
+
     return (
         f"<code>┌──({username}㉿Rain)-[/audit]</code>\n"
         f"<code>└─$ sudo profilectl audit</code>\n"
@@ -166,8 +185,8 @@ def _build_audit_profile(user, telegram_id: int) -> str:
         f"<code>Joined      {member_since}</code>\n"
         f"<code>{_DASH_LINE}</code>\n"
         f"<code>ACCOUNT</code>\n"
-        f"<code>Balance     ${balance:.2f}</code>\n"
-        f"<code>Status      {_status(balance)}</code>\n"
+        f"<code>Balance     ${balance_str}</code>\n"
+        f"<code>Status      {_status(numeric_bal)}</code>\n"
         f"<code>Deposited   ${total_dep:.2f}</code>\n"
         f"<code>Spent       ${total_spent:.2f}</code>\n"
         f"<code>Rewards     ${ref_earnings:.2f}</code>\n"
@@ -188,8 +207,10 @@ def _build_audit_profile(user, telegram_id: int) -> str:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _build_start_welcome(user, full_name: str) -> str:
-    """Terminal-style welcome dashboard."""
-    balance = float(getattr(user, 'balance_display', float(user.balance or 0)))
+    """Terminal-style welcome dashboard with exact fractional balance display."""
+    balance_raw = getattr(user, 'balance_display', getattr(user, 'balance', 0))
+    balance_str = _format_balance(balance_raw)
+
     total_orders = int(getattr(user, 'total_orders', 0) or 0)
     total_refs = int(getattr(user, 'total_referrals', 0) or 0)
 
@@ -201,7 +222,7 @@ def _build_start_welcome(user, full_name: str) -> str:
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👋 Welcome back, {safe(first_name)}\n\n"
         "💎 Standard Plan\n\n"
-        f"💰 Wallet: ${balance:.2f}\n"
+        f"💰 Wallet: ${balance_str}\n"
         f"📦 Orders: {total_orders}\n"
         f"🎁 Rewards: {total_refs}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -224,7 +245,7 @@ def _build_start_welcome(user, full_name: str) -> str:
         "</blockquote>\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📢 Stay Updated: @rainworlddd\n\n"
+        "📢 Stay Updated: @Senacoun\n\n"
         "👇 Tap a button below to get started."
     )
 
@@ -373,6 +394,13 @@ def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_pay
             "referral_bonus": referral_bonus,
             "referral_code": user.referral_code,
             "referred_by": getattr(user, "referred_by", None),
+            # Return the dashboard values from the same transaction. This
+            # removes the second remote database query from every /start.
+            "profile": {
+                "balance": user.balance,
+                "total_orders": user.total_orders,
+                "total_referrals": user.total_referrals,
+            },
         }
 
 
@@ -438,16 +466,10 @@ async def start_cmd(message: Message, command: CommandObject):
         )
         await message.answer(welcome_text, parse_mode="HTML", disable_web_page_preview=True)
 
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.telegram_id == telegram_id).first()
-        if user:
-            text = _build_start_welcome(user, full_name)
-            is_admin = telegram_id in ADMIN_IDS
-            keyboard = get_admin_main_menu() if is_admin else get_main_menu()
-            await message.answer(
-                text, reply_markup=keyboard, parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-    finally:
-        db.close()
+    user = SimpleNamespace(**result["profile"])
+    text = _build_start_welcome(user, full_name)
+    keyboard = get_admin_main_menu() if is_admin else get_main_menu()
+    await message.answer(
+        text, reply_markup=keyboard, parse_mode="HTML",
+        disable_web_page_preview=True
+    )

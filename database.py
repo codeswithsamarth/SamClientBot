@@ -1,44 +1,22 @@
 """
 database.py
 
-Engine / session configuration for TiDB Cloud (MySQL wire protocol,
-via PyMySQL) using SQLAlchemy 2.x.
+SQLAlchemy 2.x database configuration for TiDB Cloud
+(MySQL wire protocol via PyMySQL).
 
-Notes on the choices below, since they're easy to get subtly wrong
-against TiDB specifically:
+Designed for:
+- TiDB Cloud
+- Render web services
+- Local development
+- SQLAlchemy 2.x
 
-- SQLAlchemy 2.0 has no `future=` flag anymore — "future style" is
-  the only style, so there's nothing to opt into. (Passing future=
-  to create_engine() on 2.0 is not needed and is not used here.)
-
-- `expire_on_commit=False` is required for this project: handlers
-  read attributes off ORM objects (order.id, user.balance, etc.)
-  *after* db.commit() inside the same request, often after the
-  session has already been closed in a `finally:` block. With the
-  default `expire_on_commit=True`, that first attribute access after
-  commit would silently try to re-run a SELECT on a closed session
-  and raise.
-
-- TiDB defaults to pessimistic transactions since TiDB 5.0, but that
-  is a *cluster-level* default (`tidb_txn_mode`) that can be
-  overridden per-session. `with_for_update()` (SELECT ... FOR UPDATE)
-  only actually blocks other transactions under pessimistic mode. If
-  this cluster (or a future one this bot is pointed at) ever has
-  `tidb_txn_mode = 'optimistic'` as its default, `with_for_update()`
-  would silently become a no-op instead of a real lock — no error,
-  just no locking. We remove that ambiguity entirely by setting
-  `tidb_txn_mode = 'pessimistic'` explicitly on every new connection
-  in `_set_tidb_session_options` below, instead of trusting the
-  cluster default.
-
-- Even with real pessimistic locks, TiDB can still raise a write
-  conflict (error 9007, "Write conflict") when two pessimistic
-  transactions genuinely collide, or a "Table 'x' doesn't exist" style
-  transient error after a schema change propagates across the
-  cluster. The right response to error 9007 specifically is "retry the
-  whole transaction" — it is not a bug, it's TiDB telling you to try
-  again. `run_with_retry()` / the `@retry_on_write_conflict` decorator
-  below exist for exactly this.
+Important:
+- Database credentials come from config.py / environment variables.
+- Do not hard-code credentials here.
+- TiDB transactions are explicitly configured as pessimistic.
+- expire_on_commit=False is intentional because handlers may access
+  ORM attributes after commit.
+- Retry helpers are provided for transient TiDB write conflicts.
 """
 
 from __future__ import annotations
@@ -49,9 +27,9 @@ import time
 from contextlib import contextmanager
 from urllib.parse import quote_plus
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session, sessionmaker, declarative_base
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from config import (
     MYSQL_USER,
@@ -60,18 +38,25 @@ from config import (
     MYSQL_PORT,
     MYSQL_DB,
     MYSQL_SSL_CA,
+    DATABASE_POOL_SIZE,
+    DATABASE_MAX_OVERFLOW,
+    DATABASE_POOL_RECYCLE,
+    DATABASE_POOL_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------
-# CONNECTION
-# -----------------------------------------------------------------
 
-encoded_password = quote_plus(MYSQL_PASSWORD)
+# ---------------------------------------------------------------------------
+# DATABASE CONNECTION
+# ---------------------------------------------------------------------------
+
+# Escape the password so special characters such as @, :, /, #, etc.
+# do not break the SQLAlchemy connection URL.
+encoded_password = quote_plus(str(MYSQL_PASSWORD))
 
 DATABASE_URL = (
-    f"mysql+pymysql://"
+    "mysql+pymysql://"
     f"{MYSQL_USER}:"
     f"{encoded_password}@"
     f"{MYSQL_HOST}:"
@@ -81,18 +66,45 @@ DATABASE_URL = (
 
 logger.info(
     "Connecting to TiDB Cloud | host=%s port=%s db=%s user=%s",
-    MYSQL_HOST, MYSQL_PORT, MYSQL_DB, MYSQL_USER,
+    MYSQL_HOST,
+    MYSQL_PORT,
+    MYSQL_DB,
+    MYSQL_USER,
 )
+
+
+# ---------------------------------------------------------------------------
+# ENGINE
+# ---------------------------------------------------------------------------
+#
+# The pool size is configured through environment variables so it can match
+# the database plan and the Render service's expected concurrency.
+#
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,     # discard dead connections instead of erroring
-    pool_recycle=3600,      # recycle before TiDB/any LB idle-closes it
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
+
+    # Verify pooled connections before using them.
+    pool_pre_ping=True,
+
+    # Recycle connections before an intermediary/LB/TiDB closes them.
+    pool_recycle=3600,
+
+    # Use the deployment-configured pool. The old fixed pool of two caused
+    # normal commands to queue behind payment checks that use the database.
+    pool_size=DATABASE_POOL_SIZE,
+    max_overflow=DATABASE_MAX_OVERFLOW,
+
+    # Do not wait forever for a connection.
+    pool_timeout=DATABASE_POOL_TIMEOUT,
+
+    # Roll back any unfinished transaction when a connection returns
+    # to the pool.
     pool_reset_on_return="rollback",
+
     echo=False,
+
+    # TiDB Cloud requires TLS.
     connect_args={
         "ssl_ca": MYSQL_SSL_CA,
         "ssl_verify_cert": True,
@@ -101,131 +113,378 @@ engine = create_engine(
 )
 
 
+# ---------------------------------------------------------------------------
+# TiDB SESSION OPTIONS
+# ---------------------------------------------------------------------------
+
 @event.listens_for(engine, "connect")
-def _set_tidb_session_options(dbapi_connection, connection_record):
+def _set_tidb_session_options(
+    dbapi_connection,
+    connection_record,
+):
     """
-    Runs once per new physical connection (not per checkout — this is
-    the DBAPI 'connect' event, not 'checkout'). Forces pessimistic
-    transaction mode explicitly rather than trusting the cluster
-    default, so with_for_update() is guaranteed to take a real lock.
+    Configure every newly-created physical DB connection.
+
+    TiDB supports pessimistic transactions, which are required for
+    SELECT ... FOR UPDATE to provide actual row locking.
+
+    This is intentionally configured per connection instead of relying
+    on the TiDB cluster's global/default transaction mode.
+
+    If the application is pointed at ordinary MySQL during local
+    development, tidb_txn_mode may not exist. In that case we log the
+    issue and allow the connection to continue.
     """
+
     cursor = dbapi_connection.cursor()
+
     try:
-        cursor.execute("SET SESSION tidb_txn_mode = 'pessimistic'")
+        cursor.execute(
+            "SET SESSION tidb_txn_mode = 'pessimistic'"
+        )
+
     except Exception:
-        # If this is ever pointed at plain MySQL (e.g. local dev),
-        # tidb_txn_mode won't exist — don't crash startup over it.
         logger.warning(
-            "Could not set tidb_txn_mode=pessimistic (not TiDB?) — "
-            "continuing with engine defaults.",
+            "Could not set tidb_txn_mode=pessimistic. "
+            "The database may not be TiDB. Continuing with "
+            "the database default.",
             exc_info=True,
         )
+
     finally:
         cursor.close()
 
+
+# ---------------------------------------------------------------------------
+# SESSION FACTORY
+# ---------------------------------------------------------------------------
 
 SessionLocal = sessionmaker(
     bind=engine,
     autocommit=False,
     autoflush=False,
+
+    # IMPORTANT:
+    #
+    # After commit(), SQLAlchemy normally expires ORM attributes.
+    # Setting this to False allows handlers to continue accessing
+    # attributes such as:
+    #
+    #     user.balance
+    #     order.id
+    #     product.stock
+    #
+    # after db.commit().
     expire_on_commit=False,
 )
+
+
+# ---------------------------------------------------------------------------
+# ORM BASE
+# ---------------------------------------------------------------------------
 
 Base = declarative_base()
 
 
+# ---------------------------------------------------------------------------
+# DATABASE DEPENDENCY
+# ---------------------------------------------------------------------------
+
 def get_db():
+    """
+    Generator-style database dependency.
+
+    Example:
+
+        db = next(get_db())
+
+    or in code using dependency injection:
+
+        db: Session = Depends(get_db)
+
+    The session is always closed after use.
+    """
+
     db = SessionLocal()
+
     try:
         yield db
+
     finally:
         db.close()
 
 
-# -----------------------------------------------------------------
-# TRANSACTION HELPERS
-# -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TRANSACTION HELPER
+# ---------------------------------------------------------------------------
 
 @contextmanager
 def transaction():
     """
-    One session, one transaction: commits on clean exit, rolls back
-    and re-raises on any exception, always closes.
+    Execute a complete operation inside one database transaction.
+
+    The transaction:
+
+        - commits when the block exits successfully
+        - rolls back when an exception occurs
+        - always closes the session
+
+    Example:
 
         with transaction() as db:
-            user = db.query(User).filter(...).with_for_update().first()
-            ...
-            db.add(order)
-        # committed here, or rolled back if anything raised
+            user = (
+                db.query(User)
+                .filter(User.id == user_id)
+                .with_for_update()
+                .first()
+            )
 
-    Use this (or run_with_retry() below, which wraps this) for any
-    write path that touches more than one row/table and needs all of
-    it to succeed or none of it to — balance deduction + stock
-    deduction + order insert must land together.
+            user.balance -= amount
+
+            db.add(order)
+
+    This makes multi-step operations atomic.
+
+    For example:
+
+        balance deduction
+        +
+        stock deduction
+        +
+        order creation
+
+    will either all commit or all roll back.
     """
+
     db: Session = SessionLocal()
+
     try:
         yield db
         db.commit()
+
     except Exception:
         db.rollback()
         raise
+
     finally:
         db.close()
 
 
-# TiDB write-conflict error code. Seen as OperationalError with this
-# code embedded, e.g.:
-#   (1105, 'Information schema is changed...')  -> schema race, retry
-#   (9007, 'Write conflict...')                  -> txn race, retry
-#   (1213, 'Deadlock found...')                  -> two txns locking
-#                                                    rows in opposite
-#                                                    order, retry
-_RETRYABLE_TIDB_ERROR_CODES = (9007, 1105, 8022, 8028, 1213)
+# ---------------------------------------------------------------------------
+# RETRYABLE TiDB ERRORS
+# ---------------------------------------------------------------------------
+
+#
+# TiDB can return transient errors when concurrent transactions collide
+# or when schema information changes while requests are running.
+#
+# Common retryable codes:
+#
+# 9007 -> Write conflict
+# 1105 -> Various transient/schema-related TiDB errors
+# 8022 -> TiDB transaction-related transient error
+# 8028 -> TiDB transaction-related transient error
+# 1213 -> Deadlock
+#
+
+_RETRYABLE_TIDB_ERROR_CODES = (
+    9007,
+    1105,
+    8022,
+    8028,
+    1213,
+)
 
 
 def _is_retryable(exc: Exception) -> bool:
+    """
+    Return True if the exception is a retryable TiDB OperationalError.
+    """
+
     if not isinstance(exc, OperationalError):
         return False
-    orig = getattr(exc, "orig", None)
-    args = getattr(orig, "args", ()) if orig is not None else ()
+
+    original = getattr(exc, "orig", None)
+
+    if original is None:
+        return False
+
+    args = getattr(original, "args", ())
+
     if not args:
         return False
+
     code = args[0]
+
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return False
+
     return code in _RETRYABLE_TIDB_ERROR_CODES
 
 
-def retry_on_write_conflict(max_attempts: int = 3, base_delay: float = 0.05):
-    """
-    Decorator for a function whose ENTIRE body is one transaction
-    attempt (typically one that opens its own `with transaction():`
-    block). On a retryable TiDB error, the function is called again
-    from scratch, up to `max_attempts` times, with a short backoff.
+# ---------------------------------------------------------------------------
+# TRANSACTION RETRY DECORATOR
+# ---------------------------------------------------------------------------
 
-    Do NOT wrap a function that has already committed some of its
-    work and only fails partway through outside a transaction — this
-    only makes sense around a single all-or-nothing attempt.
+def retry_on_write_conflict(
+    max_attempts: int = 3,
+    base_delay: float = 0.05,
+):
     """
+    Retry a complete transactional operation when TiDB reports a
+    transient write conflict, deadlock, or related retryable error.
+
+    IMPORTANT:
+
+    The decorated function should represent ONE complete transaction
+    attempt.
+
+    Good:
+
+        @retry_on_write_conflict()
+        def create_order(...):
+            with transaction() as db:
+                ...
+                db.add(order)
+
+    Bad:
+
+        @retry_on_write_conflict()
+        def something():
+            db.commit()
+            do_something_else()
+            db.commit()
+
+    The retry must be able to safely repeat the ENTIRE operation.
+    """
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    if base_delay < 0:
+        raise ValueError("base_delay cannot be negative")
+
     def decorator(func):
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            last_exc = None
+
+            last_exception = None
+
             for attempt in range(1, max_attempts + 1):
+
                 try:
                     return func(*args, **kwargs)
+
                 except OperationalError as exc:
-                    if not _is_retryable(exc) or attempt == max_attempts:
+
+                    # Immediately re-raise non-retryable errors.
+                    if not _is_retryable(exc):
                         raise
-                    last_exc = exc
+
+                    # Do not retry after the final attempt.
+                    if attempt >= max_attempts:
+                        raise
+
+                    last_exception = exc
+
+                    # Exponential backoff:
+                    #
+                    # attempt 1 -> base_delay
+                    # attempt 2 -> base_delay * 2
+                    # attempt 3 -> base_delay * 4
+                    #
                     delay = base_delay * (2 ** (attempt - 1))
+
                     logger.warning(
-                        "Retryable TiDB error on attempt %s/%s for %s: %s "
-                        "— retrying in %.2fs",
-                        attempt, max_attempts, func.__name__, exc, delay,
+                        "Retryable TiDB error on attempt "
+                        "%s/%s for %s: %s. "
+                        "Retrying in %.2f seconds.",
+                        attempt,
+                        max_attempts,
+                        func.__name__,
+                        exc,
+                        delay,
                     )
+
                     time.sleep(delay)
-            # Unreachable, but keeps type checkers happy.
-            if last_exc:
-                raise last_exc
+
+            # This should never normally execute.
+            if last_exception is not None:
+                raise last_exception
+
+            raise RuntimeError(
+                f"{func.__name__} failed without an exception"
+            )
+
         return wrapper
+
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# OPTIONAL SIMPLE RETRY HELPER
+# ---------------------------------------------------------------------------
+
+def run_with_retry(
+    func,
+    *args,
+    max_attempts: int = 3,
+    base_delay: float = 0.05,
+    **kwargs,
+):
+    """
+    Execute a callable with TiDB retry handling.
+
+    The callable must contain the COMPLETE transactional operation.
+
+    Example:
+
+        def create_order():
+            with transaction() as db:
+                ...
+
+        result = run_with_retry(create_order)
+    """
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    last_exception = None
+
+    for attempt in range(1, max_attempts + 1):
+
+        try:
+            return func(*args, **kwargs)
+
+        except OperationalError as exc:
+
+            if not _is_retryable(exc):
+                raise
+
+            if attempt >= max_attempts:
+                raise
+
+            last_exception = exc
+
+            delay = base_delay * (2 ** (attempt - 1))
+
+            logger.warning(
+                "Retryable TiDB error on attempt "
+                "%s/%s for %s: %s. "
+                "Retrying in %.2f seconds.",
+                attempt,
+                max_attempts,
+                getattr(func, "__name__", repr(func)),
+                exc,
+                delay,
+            )
+
+            time.sleep(delay)
+
+    if last_exception is not None:
+        raise last_exception
+
+    raise RuntimeError("Database operation failed without an exception")

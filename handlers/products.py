@@ -1,8 +1,7 @@
-# handlers/products.py
-
 import asyncio
 import json
 import logging
+import time
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from html import escape as _esc
 from datetime import datetime
@@ -26,13 +25,28 @@ from database import SessionLocal, transaction, retry_on_write_conflict
 from models.product import Product
 from models.user import User
 from models.order import Order
+from models.custom_rate import CustomRate
+from models.rate_control import ProductRateControl, RateControlAssignment
+
+# Reseller Manager & Reseller Config imports
+try:
+    from services.reseller_manager import ResellerManager, ResellerAPIError
+except ImportError:
+    ResellerManager = None
+    ResellerAPIError = Exception
+
+try:
+    from services.reseller_config import get_reseller, get_all_resellers
+except ImportError:
+    get_reseller = None
+    get_all_resellers = None
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║                     CONFIGURATION                           ║
+# ║                     CONFIGURATION                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 PREORDER_MAX_QTY = 10
@@ -57,11 +71,291 @@ GROUP_ID = getattr(config, "GROUP_ID", None)
 GROUP_NOTIFICATIONS = getattr(config, "GROUP_NOTIFICATIONS", False)
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║                   UI HELPERS                                ║
+# ║            RESELLER LIVE STOCK CACHE & HELPERS               ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+_reseller_stock_cache: dict[str, int] = {}
+_reseller_stock_cache_time: float = 0.0
+_reseller_cache_lock = asyncio.Lock()
+RESELLER_CACHE_TTL = 30  # 30s TTL to strictly respect rate limits
+
+# Per-user per-provider in-flight import locks
+_reseller_import_locks: set[tuple[int, str]] = set()
+
+
+def _get_reseller_credentials(reseller_id: str | int | None = None) -> dict:
+    """
+    Dynamically loads provider configuration by ID or name,
+    falling back to active provider configurations or config.py.
+    """
+    db = SessionLocal()
+    try:
+        from handlers.admin_products import _get_provider_by_id
+        prov = _get_provider_by_id(db, str(reseller_id) if reseller_id is not None else None)
+    except Exception:
+        prov = None
+    finally:
+        db.close()
+
+    if prov:
+        if "em_store" in str(prov.get("id", "")).lower() or "ssondigitalworks" in str(prov.get("base_url", "")):
+            prov["auth_type"] = "bearer"
+        return prov
+
+    base_url = None
+    api_key = None
+    name = "Excalibur Shop Bot"
+    res = None
+
+    if get_reseller and reseller_id:
+        try:
+            res = get_reseller(str(reseller_id))
+        except Exception:
+            res = None
+
+    if res:
+        base_url = getattr(res, "base_url", None) or (res.get("base_url") if isinstance(res, dict) else None)
+        api_key = getattr(res, "api_key", None) or (res.get("api_key") if isinstance(res, dict) else None)
+        name = getattr(res, "name", None) or (res.get("name") if isinstance(res, dict) else "Reseller")
+
+    if not base_url or not api_key:
+        base_url = getattr(config, "RESELLER_BASE_URL", None) or getattr(config, "RESELLER_URL",
+                                                                         None) or "https://arrsnetworkzone.in"
+        api_key = getattr(config, "RESELLER_API_KEY", None) or getattr(config, "RESELLER_KEY", None)
+        name = name or "Excalibur Shop Bot"
+
+    clean_base_url = (base_url or "").replace("/docs", "").rstrip("/")
+    is_em = "em_store" in str(reseller_id or "").lower() or "ssondigitalworks" in clean_base_url
+
+    return {
+        "id": str(reseller_id) if reseller_id else "excalibur",
+        "base_url": clean_base_url,
+        "api_key": api_key,
+        "name": name,
+        "auth_type": "bearer" if is_em else "header",
+    }
+
+
+async def _call_reseller_get_products(manager) -> list | dict:
+    """Helper to call get_products whether sync or async."""
+    res = manager.get_products()
+    if asyncio.iscoroutine(res):
+        return await res
+    return res
+
+
+async def _call_reseller_place_order(manager, service_id: str, quantity: int, external_order_id: str) -> dict | list:
+    """Helper to place an order via ResellerManager whether sync or async."""
+    if hasattr(manager, "place_order"):
+        res = manager.place_order(service_id=service_id, quantity=quantity, external_order_id=external_order_id)
+    elif hasattr(manager, "create_order"):
+        res = manager.create_order(service_id=service_id, quantity=quantity, external_order_id=external_order_id)
+    elif hasattr(manager, "order"):
+        res = manager.order(service_id=service_id, quantity=quantity, external_order_id=external_order_id)
+    else:
+        raise AttributeError("ResellerManager missing place_order method")
+
+    if asyncio.iscoroutine(res):
+        return await res
+    return res
+
+
+async def _refresh_reseller_stock_cache_if_needed():
+    """
+    Fetch live product stock across ALL active providers and update cache.
+    Refreshes at most once every 30 seconds across all users.
+    """
+    global _reseller_stock_cache_time, _reseller_stock_cache
+
+    if not ResellerManager:
+        return _reseller_stock_cache
+
+    async with _reseller_cache_lock:
+        now = asyncio.get_event_loop().time()
+        if _reseller_stock_cache and (now - _reseller_stock_cache_time) < RESELLER_CACHE_TTL:
+            return _reseller_stock_cache
+
+        db = SessionLocal()
+        try:
+            from handlers.admin_products import _get_all_active_providers
+            providers = _get_all_active_providers(db)
+        except Exception:
+            providers = []
+        finally:
+            db.close()
+
+        if not providers:
+            creds = _get_reseller_credentials()
+            if creds.get("api_key") and creds.get("base_url"):
+                providers = [creds]
+
+        new_cache = {}
+        for prov in providers:
+            api_key = prov.get("api_key")
+            base_url = prov.get("base_url")
+            if not api_key or not base_url:
+                continue
+
+            try:
+                manager = ResellerManager(api_key=api_key, base_url=base_url, provider_config=prov)
+                reseller_data = await _call_reseller_get_products(manager)
+
+                services = []
+                if isinstance(reseller_data, list):
+                    services = reseller_data
+                elif isinstance(reseller_data, dict):
+                    services = (
+                            reseller_data.get("services", [])
+                            or reseller_data.get("products", [])
+                            or reseller_data.get("data", [])
+                    )
+
+                for s in services:
+                    if isinstance(s, dict):
+                        sid = str(
+                            s.get("service_id")
+                            or s.get("provider_product_id")
+                            or s.get("id", "")
+                        ).strip()
+
+                        raw_stk = s.get("stock")
+                        if raw_stk is not None:
+                            try:
+                                stk = int(raw_stk)
+                            except (ValueError, TypeError):
+                                stk = 999999
+                        else:
+                            stk = 999999
+
+                        if sid:
+                            new_cache[sid] = stk
+            except Exception as e:
+                logger.warning("Error refreshing reseller stock for provider %s: %s", prov.get("name", "Reseller"), e)
+
+        if new_cache:
+            _reseller_stock_cache.update(new_cache)
+        _reseller_stock_cache_time = now
+
+        return _reseller_stock_cache
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                        UI HELPERS                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _money(value) -> Decimal:
     return Decimal(str(value)).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _active_custom_price(db, telegram_id: int, product_id: int) -> Decimal | None:
+    """Product-specific rate wins over the user's all-products rate."""
+    product_rate = (
+        db.query(CustomRate.price)
+        .filter(CustomRate.telegram_id == telegram_id, CustomRate.product_id == product_id,
+                CustomRate.is_active == True)
+        .order_by(CustomRate.id.desc())
+        .first()
+    )
+    if product_rate:
+        return _money(product_rate[0])
+    all_products_rate = (
+        db.query(CustomRate.price)
+        .filter(CustomRate.telegram_id == telegram_id, CustomRate.product_id.is_(None),
+                CustomRate.is_active == True)
+        .order_by(CustomRate.id.desc())
+        .first()
+    )
+    if all_products_rate:
+        return _money(all_products_rate[0])
+
+    # Rate Control is a live lookup: editing a product's controlled price in
+    # Admin applies to every assigned user immediately, even on an old screen.
+    has_rate_control = (
+        db.query(RateControlAssignment.id)
+        .filter(
+            RateControlAssignment.telegram_id == telegram_id,
+            RateControlAssignment.is_active == True,
+        )
+        .first()
+    )
+    if not has_rate_control:
+        return None
+    controlled_price = (
+        db.query(ProductRateControl.price)
+        .filter(
+            ProductRateControl.product_id == product_id,
+            ProductRateControl.is_active == True,
+        )
+        .first()
+    )
+    return _money(controlled_price[0]) if controlled_price else None
+
+
+def _get_custom_price(telegram_id: int, product_id: int) -> Decimal | None:
+    db = SessionLocal()
+    try:
+        return _active_custom_price(db, telegram_id, product_id)
+    finally:
+        db.close()
+
+
+def _get_catalog_custom_prices(telegram_id: int, product_ids: list[int]) -> dict[int, Decimal]:
+    """Load custom prices for a whole catalog without a database query per button."""
+    ids = list({int(product_id) for product_id in product_ids})
+    if not ids:
+        return {}
+    db = SessionLocal()
+    try:
+        specific_rates = (
+            db.query(CustomRate.product_id, CustomRate.price)
+            .filter(
+                CustomRate.telegram_id == telegram_id,
+                CustomRate.product_id.in_(ids),
+                CustomRate.is_active == True,
+            )
+            .order_by(CustomRate.id.desc())
+            .all()
+        )
+        prices: dict[int, Decimal] = {}
+        for product_id, price in specific_rates:
+            prices.setdefault(product_id, _money(price))
+
+        all_products_rate = (
+            db.query(CustomRate.price)
+            .filter(
+                CustomRate.telegram_id == telegram_id,
+                CustomRate.product_id.is_(None),
+                CustomRate.is_active == True,
+            )
+            .order_by(CustomRate.id.desc())
+            .first()
+        )
+        if all_products_rate:
+            default_price = _money(all_products_rate[0])
+            return {product_id: prices.get(product_id, default_price) for product_id in ids}
+
+        has_rate_control = (
+            db.query(RateControlAssignment.id)
+            .filter(
+                RateControlAssignment.telegram_id == telegram_id,
+                RateControlAssignment.is_active == True,
+            )
+            .first()
+        )
+        if has_rate_control:
+            controlled_rates = (
+                db.query(ProductRateControl.product_id, ProductRateControl.price)
+                .filter(
+                    ProductRateControl.product_id.in_(ids),
+                    ProductRateControl.is_active == True,
+                )
+                .all()
+            )
+            for product_id, price in controlled_rates:
+                prices.setdefault(product_id, _money(price))
+        return prices
+    finally:
+        db.close()
 
 
 def _divider(char: str = "━", length: int = 30) -> str:
@@ -77,7 +371,7 @@ def _border_box(title: str, emoji: str = "📦") -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║            CATEGORY -> BUTTON STYLE MAPPING                 ║
+# ║            CATEGORY -> BUTTON STYLE MAPPING                  ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 CATEGORY_CONFIG = {
@@ -90,6 +384,7 @@ CATEGORY_CONFIG = {
     "software": {"icon": "💻", "label": "Software", "style": "primary", "color": "🔵"},
     "education": {"icon": "📚", "label": "Education", "style": "success", "color": "🟢"},
     "out of stock": {"icon": "🚫", "label": "Out of Stock", "style": "danger", "color": "⚫"},
+    "reseller": {"icon": "🔗", "label": "Reseller API", "style": "primary", "color": "🔵"},
 }
 
 DEFAULT_CATEGORY_CONFIG = {"icon": "📦", "label": "General", "style": "primary", "color": "🔵"}
@@ -106,12 +401,14 @@ def _category_style(category: str | None) -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              STOCK DISPLAY HELPERS                          ║
+# ║              STOCK DISPLAY HELPERS                           ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _stock_indicator(stock: int) -> str:
     if stock <= 0:
         return "🔴 <b>Out of Stock</b>"
+    elif stock >= 999999:
+        return "🟢 <b>In Stock</b>"
     elif stock <= 3:
         return f"🟡 <b>Low Stock</b> ({stock} left)"
     elif stock <= 10:
@@ -121,14 +418,11 @@ def _stock_indicator(stock: int) -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              BULK PRICING HELPERS                           ║
+# ║              BULK PRICING HELPERS                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _get_bulk_price(bulk_pricing, quantity: int):
-    """
-    Get the applicable bulk price for a given quantity.
-    Returns None if no bulk pricing applies or no matching tier found.
-    """
+    """Get the applicable bulk price for a given quantity."""
     if not bulk_pricing:
         return None
 
@@ -189,7 +483,7 @@ def _format_bulk_pricing_text(bulk_pricing) -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║                   FSM STATES                                ║
+# ║                        FSM STATES                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 class PurchaseStates(StatesGroup):
@@ -201,7 +495,7 @@ class SearchStates(StatesGroup):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║         IN-MEMORY STORES                                    ║
+# ║          IN-MEMORY STORES                                    ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 _notify_subscribers: dict[int, list[int]] = {}
@@ -261,9 +555,9 @@ async def _search_products(query: str) -> list:
             .filter(
                 Product.is_active == True,
                 (
-                    Product.name.ilike(search_term) |
-                    Product.category.ilike(search_term) |
-                    Product.description.ilike(search_term)
+                        Product.name.ilike(search_term) |
+                        Product.category.ilike(search_term) |
+                        Product.description.ilike(search_term)
                 )
             )
             .order_by(Product.id.asc())
@@ -275,7 +569,7 @@ async def _search_products(query: str) -> list:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              PER-USER PURCHASE LOCK                         ║
+# ║              PER-USER PURCHASE LOCK                          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 _purchase_locks: dict[int, asyncio.Lock] = {}
@@ -292,7 +586,7 @@ async def _get_purchase_lock(telegram_id: int) -> asyncio.Lock:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              CACHED PRODUCTS FETCH (30s TTL)               ║
+# ║              CACHED PRODUCTS FETCH (30s TTL)                 ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 _products_cache: dict = {"data": None, "timestamp": 0}
@@ -368,7 +662,27 @@ def _accounts(product) -> list[str]:
 
 
 def _real_stock(product) -> int:
-    """Fast stock check — avoids _accounts() for manual delivery products."""
+    """
+    Fast stock check:
+    - RESELLER PRODUCT: Looks up live/cached stock from Reseller API via reseller_service_id.
+      Falls back to database Product.stock if not found in live cache.
+    - OWN PRODUCT (Manual): Returns product.stock.
+    - OWN PRODUCT (Automatic/Hybrid): Counts local accounts in file_content.
+    """
+    source = getattr(product, "source", "own") or "own"
+    if source == "reseller":
+        service_id = str(getattr(product, "reseller_service_id", "") or "").strip()
+        db_stock = getattr(product, "stock", 0)
+        fallback_stock = db_stock if (db_stock is not None and db_stock > 0) else 0
+
+        if not service_id:
+            return fallback_stock
+
+        if service_id in _reseller_stock_cache:
+            return _reseller_stock_cache[service_id]
+
+        return fallback_stock
+
     delivery_type = (product.delivery_type or "automatic").lower()
     if delivery_type == "manual":
         return product.stock or 0
@@ -379,14 +693,17 @@ def _real_stock(product) -> int:
 
 
 def _get_max_qty(product) -> int:
+    if float(product.price) == 0:
+        return 1
     cap = _real_stock(product)
-    if cap <= 0 and product.preorder:
+    source = getattr(product, "source", "own") or "own"
+    if cap <= 0 and product.preorder and source != "reseller":
         return PREORDER_MAX_QTY
     return max(cap, 0)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║      STOCK CHANGE TRACKING — RESTOCK / NEW PRODUCT /        ║
+# ║      STOCK CHANGE TRACKING — RESTOCK / NEW PRODUCT /         ║
 # ║      LIMITED STOCK BROADCASTS (→ STOCK_GROUP_ID, user-facing)║
 # ╚══════════════════════════════════════════════════════════════╝
 
@@ -396,14 +713,13 @@ _stock_scan_seeded = False
 
 
 def _stockctl_block(
-    action: str,
-    steps: list[str],
-    product,
-    status_label: str,
-    closing: str,
-    extra_fields: list[tuple[str, str]] | None = None,
+        action: str,
+        steps: list[str],
+        product,
+        status_label: str,
+        closing: str,
+        extra_fields: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Renders a terminal/CLI-styled block (stockctl-style) as a Telegram <pre> block."""
     cat_config = _get_category_config(product.category)
 
     fields = [
@@ -537,14 +853,6 @@ def _fire_stock_scan(bot, products: list):
 
 
 async def notify_new_product(bot, product):
-    """
-    Call this immediately after creating a new Product row in your admin
-    panel, e.g. in admin.py:
-        db.add(product)
-        db.commit()
-        db.refresh(product)
-        await notify_new_product(callback.bot, product)
-    """
     stock = _real_stock(product)
     threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
 
@@ -558,14 +866,14 @@ async def notify_new_product(bot, product):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              FREEBIES MENU                                  ║
+# ║              FREEBIES MENU                                   ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data == "freebies_menu")
 async def freebies_menu(callback: CallbackQuery):
-    """Display all free products (price = 0) like the regular product catalog."""
     await callback.answer()
 
+    await _refresh_reseller_stock_cache_if_needed()
     products = await asyncio.to_thread(_fetch_free_products)
 
     if not products:
@@ -582,7 +890,8 @@ async def freebies_menu(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🛍 Browse Paid Products", callback_data="products_menu", style="primary")],
+                    [InlineKeyboardButton(text="🛍 Browse Paid Products", callback_data="products_menu",
+                                          style="primary")],
                     [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
                 ]
             ),
@@ -605,7 +914,8 @@ async def freebies_menu(callback: CallbackQuery):
     for p in products:
         cat_config = _get_category_config(p.category)
         stock = _real_stock(p)
-        stock_badge = "🔴 OOS" if stock <= 0 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}")
+        stock_badge = "🔴 OOS" if stock <= 0 else (
+            f"🟢 In Stock" if stock >= 999999 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"))
 
         keyboard.append([
             InlineKeyboardButton(
@@ -624,7 +934,7 @@ async def freebies_menu(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              PRODUCTS MENU (PAID ONLY)                      ║
+# ║              PRODUCTS MENU (PAID ONLY)                       ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data == "products_menu")
@@ -654,7 +964,16 @@ async def products_menu(callback: CallbackQuery):
         )
         return
 
+    # Never hold up the customer catalog for a reseller API call. Local
+    # products render immediately from the database cache; reseller stock is
+    # refreshed in the background and keeps its last known value meanwhile.
+    if any((getattr(product, "source", "own") or "own") == "reseller" for product in products):
+        asyncio.create_task(_refresh_reseller_stock_cache_if_needed())
+
     _fire_stock_scan(callback.bot, products)
+    custom_prices = await asyncio.to_thread(
+        _get_catalog_custom_prices, callback.from_user.id, [product.id for product in products]
+    )
 
     categories = {}
     for p in products:
@@ -682,13 +1001,16 @@ async def products_menu(callback: CallbackQuery):
     for p in products:
         cat_config = _get_category_config(p.category)
         stock = _real_stock(p)
-        price = _money(p.price)
-        stock_badge = "🔴 OOS" if stock <= 0 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}")
-        bulk_badge = " 📦" if p.bulk_pricing else ""
+        custom_price = custom_prices.get(p.id)
+        price = custom_price if custom_price is not None else _money(p.price)
+        stock_badge = "🔴 OOS" if stock <= 0 else (
+            f"🟢 In Stock" if stock >= 999999 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"))
+        custom_badge = " 🏷" if custom_price is not None else ""
+        bulk_badge = " 📦" if p.bulk_pricing and custom_price is None else ""
 
         keyboard.append([
             InlineKeyboardButton(
-                text=f"{p.icon or cat_config['icon']} {p.name} — ${price:.2f}{bulk_badge} | {stock_badge}",
+                text=f"{p.icon or cat_config['icon']} {p.name} — ${price:.2f}{custom_badge}{bulk_badge} | {stock_badge}",
                 callback_data=f"product_{p.id}",
                 style=cat_config["style"],
             )
@@ -710,7 +1032,7 @@ async def products_menu(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              FAVORITES SYSTEM                               ║
+# ║              FAVORITES SYSTEM                                ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("toggle_fav_"))
@@ -754,14 +1076,20 @@ async def favorites_menu(callback: CallbackQuery):
         )
         return
 
+    await _refresh_reseller_stock_cache_if_needed()
     products = await asyncio.to_thread(_fetch_products_by_ids, fav_ids)
 
     if not products:
         await show(callback, "⚠️ Some favorites are no longer available.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="primary")]]
-            ))
+                   reply_markup=InlineKeyboardMarkup(
+                       inline_keyboard=[
+                           [InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="primary")]]
+                   ))
         return
+
+    custom_prices = await asyncio.to_thread(
+        _get_catalog_custom_prices, user_id, [product.id for product in products]
+    )
 
     text = (
         f"⭐ <b>YOUR FAVORITES</b>\n\n"
@@ -774,10 +1102,14 @@ async def favorites_menu(callback: CallbackQuery):
         stock = _real_stock(p)
         stock_icon = "🟢" if stock > 0 else "🔴"
         is_free = float(p.price) == 0
-        price_text = "🎁 FREE" if is_free else f"💰 ${_money(p.price):.2f}"
+        custom_price = custom_prices.get(p.id)
+        price_text = "🎁 FREE" if is_free else f"💰 ${custom_price if custom_price is not None else _money(p.price):.2f}"
+        if custom_price is not None:
+            price_text += " 🏷 Custom"
+        stock_text = "In Stock" if stock >= 999999 else str(stock)
         text += (
             f"{p.icon or cat_config['icon']} <b>{_esc(p.name)}</b>\n"
-            f"  {price_text} | {stock_icon} Stock: {stock}\n"
+            f"  {price_text} | {stock_icon} Stock: {stock_text}\n"
             f"  🏷 {cat_config['color']} {cat_config['label']}\n\n"
         )
 
@@ -806,7 +1138,7 @@ async def favorites_menu(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              NOTIFY WHEN AVAILABLE                          ║
+# ║              NOTIFY WHEN AVAILABLE                           ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("notify_available_"))
@@ -869,7 +1201,7 @@ async def notify_remove(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              SEARCH FUNCTIONALITY                           ║
+# ║              SEARCH FUNCTIONALITY                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data == "search_start")
@@ -904,12 +1236,13 @@ async def search_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     await show(callback,
-               f"❌ <b>SEARCH CANCELLED</b>\n\n<b>Search cancelled.</b>\n\nBrowse all products or try again later.",        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success")],
-                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-            ]))
+               f"❌ <b>SEARCH CANCELLED</b>\n\n<b>Search cancelled.</b>\n\nBrowse all products or try again later.",
+               parse_mode="HTML",
+               reply_markup=InlineKeyboardMarkup(
+                   inline_keyboard=[
+                       [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success")],
+                       [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+                   ]))
 
 
 @router.message(SearchStates.waiting_query, F.text)
@@ -920,29 +1253,32 @@ async def search_results(message: Message, state: FSMContext):
         await state.clear()
         data = await state.get_data()
         await update_card(message, None,
-            "<b>Search cancelled.</b>\n\nBrowse all products or try again later.",
-            chat_id=data.get("_card_chat_id"), message_id=data.get("_card_message_id"),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success")]]
-            ))
+                          "<b>Search cancelled.</b>\n\nBrowse all products or try again later.",
+                          chat_id=data.get("_card_chat_id"), message_id=data.get("_card_message_id"),
+                          parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(
+                              inline_keyboard=[[InlineKeyboardButton(text="🛍 Browse Products",
+                                                                    callback_data="products_menu", style="success")]]
+                          ))
         return
 
     if len(query) < 2:
         await update_card(message, state,
-            f"⚠️ <b>Search too short</b>\n\n{_divider('─', 24)}\n\nPlease enter at least 2 characters.\n\n<i>Try a product name or category.</i>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="🛍 Browse All", callback_data="products_menu", style="primary"),
-                     InlineKeyboardButton(text="❌ Cancel", callback_data="search_cancel", style="danger")]
-                ]))
+                          f"⚠️ <b>Search too short</b>\n\n{_divider('─', 24)}\n\nPlease enter at least 2 characters.\n\n<i>Try a product name or category.</i>",
+                          parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(
+                              inline_keyboard=[
+                                  [InlineKeyboardButton(text="🛍 Browse All", callback_data="products_menu",
+                                                        style="primary"),
+                                   InlineKeyboardButton(text="❌ Cancel", callback_data="search_cancel", style="danger")]
+                              ]))
         return
 
     await update_card(message, state,
-        f"🔍 <b>Searching for:</b> <code>{_esc(query)}</code>\n\n<i>Looking through products...</i>",
-        parse_mode="HTML")
+                      f"🔍 <b>Searching for:</b> <code>{_esc(query)}</code>\n\n<i>Looking through products...</i>",
+                      parse_mode="HTML")
 
+    await _refresh_reseller_stock_cache_if_needed()
     products = await asyncio.to_thread(_search_products, query)
     await state.clear()
     data = await state.get_data()
@@ -964,6 +1300,9 @@ async def search_results(message: Message, state: FSMContext):
                  InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
             ])
     else:
+        custom_prices = await asyncio.to_thread(
+            _get_catalog_custom_prices, message.from_user.id, [product.id for product in products]
+        )
         plural = "s" if len(products) != 1 else ""
         text = (
             f"🔍 <b>SEARCH RESULTS</b>\n\n"
@@ -976,10 +1315,14 @@ async def search_results(message: Message, state: FSMContext):
             stock = _real_stock(p)
             stock_icon = "🟢" if stock > 0 else "🔴"
             is_free = float(p.price) == 0
-            price_text = "🎁 FREE" if is_free else f"💰 ${_money(p.price):.2f}"
+            custom_price = custom_prices.get(p.id)
+            price_text = "🎁 FREE" if is_free else f"💰 ${custom_price if custom_price is not None else _money(p.price):.2f}"
+            if custom_price is not None:
+                price_text += " 🏷 Custom"
+            stock_text = "In Stock" if stock >= 999999 else str(stock)
             text += (
                 f"{p.icon or cat_config['icon']} <b>{_esc(p.name)}</b>\n"
-                f"  {price_text} | {stock_icon} Stock: {stock}\n"
+                f"  {price_text} | {stock_icon} Stock: {stock_text}\n"
                 f"  🏷 {cat_config['color']} {cat_config['label']}\n\n"
             )
 
@@ -992,7 +1335,10 @@ async def search_results(message: Message, state: FSMContext):
         for p in products[:10]:
             cat_config = _get_category_config(p.category)
             is_free = float(p.price) == 0
-            price_label = "FREE!" if is_free else f"${_money(p.price):.2f}"
+            custom_price = custom_prices.get(p.id)
+            price_label = "FREE!" if is_free else f"${custom_price if custom_price is not None else _money(p.price):.2f}"
+            if custom_price is not None:
+                price_label += " 🏷"
             keyboard.append([
                 InlineKeyboardButton(
                     text=f"{p.icon or cat_config['icon']} {p.name} — {price_label}",
@@ -1010,28 +1356,34 @@ async def search_results(message: Message, state: FSMContext):
         ])
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-    await update_card(message, None, text, chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML", reply_markup=markup)
+    await update_card(message, None, text, chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
+                      reply_markup=markup)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              PRODUCT DETAILS                                ║
+# ║              PRODUCT DETAILS                                 ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("product_"))
 async def product_info(callback: CallbackQuery):
     await callback.answer()
     product_id = int(callback.data.split("_")[1])
+
+    await _refresh_reseller_stock_cache_if_needed()
     product = await asyncio.to_thread(_fetch_product, product_id)
     user_id = callback.from_user.id
+    custom_price = await asyncio.to_thread(_get_custom_price, user_id, product_id)
 
     if not product:
         await show(callback,
-                   f"❌ <b>NOT FOUND</b>\n\n<b>This product is no longer available.</b>",            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")],
-                    [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-                ]))
+                   f"❌ <b>NOT FOUND</b>\n\n<b>This product is no longer available.</b>",
+                   parse_mode="HTML",
+                   reply_markup=InlineKeyboardMarkup(
+                       inline_keyboard=[
+                           [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu",
+                                                 style="primary")],
+                           [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+                       ]))
         return
 
     _fire_stock_scan(callback.bot, [product])
@@ -1053,10 +1405,8 @@ async def product_info(callback: CallbackQuery):
     description_block = product.description.strip() if product.description else "<i>No description available.</i>"
     fav_star = "⭐" if is_fav else "☆"
 
-    # Check if product is free
-    is_free = float(product.price) == 0
-
-    # Check if delivery instruction exists 🆕
+    display_price = custom_price if custom_price is not None else _money(product.price)
+    is_free = display_price == 0
     has_instruction = bool(product.delivery_instruction)
 
     text = (
@@ -1070,11 +1420,11 @@ async def product_info(callback: CallbackQuery):
         f"<b>📊 Product Info:</b>\n"
     )
 
-
     if is_free:
         text += f"  🎁 <b>Price:</b> <code>FREE!</code>\n"
     else:
-        text += f"  💰 <b>Base Price:</b> <code>${_money(product.price):.2f}</code> each\n"
+        label = "Custom Price" if custom_price is not None else "Base Price"
+        text += f"  💰 <b>{label}:</b> <code>${display_price:.2f}</code> each\n"
 
     text += (
         f"  📦 <b>Stock:</b> {_stock_indicator(stock_count)}\n"
@@ -1088,11 +1438,9 @@ async def product_info(callback: CallbackQuery):
     if product.preorder:
         text += f"  📦 <b>Preorder:</b> ✅ Available\n"
 
-    # 🆕 Show delivery instruction indicator
     if has_instruction:
         text += f"  📋 <b>Instructions:</b> ✅ Available (shown after purchase)\n"
 
-    # Bulk pricing section - only for paid products
     if not is_free:
         text += f"\n{_divider('─', 28)}\n"
         text += f"📦 <b>Bulk Pricing:</b>\n"
@@ -1105,7 +1453,7 @@ async def product_info(callback: CallbackQuery):
 
     text += f"\n{_divider('═', 28)}\n"
 
-    if not real_stock_available and max_qty > 0:
+    if not real_stock_available and max_qty > 0 and not is_free:
         text += f"\n⚠️ <b>Out of Stock — Preorder Available</b>\n<i>Order now and receive when restocked.</i>\n"
 
     buttons = []
@@ -1113,19 +1461,21 @@ async def product_info(callback: CallbackQuery):
     if max_qty <= 0:
         text += f"\n❌ <b>Currently Unavailable</b>"
         buttons.append([
-            InlineKeyboardButton(text="🔔 Notify When Available", callback_data=f"notify_available_{product_id}", style="primary")
+            InlineKeyboardButton(text="🔔 Notify When Available", callback_data=f"notify_available_{product_id}",
+                                 style="primary")
         ])
     else:
         if is_free:
             button_text = "🎁 Claim Free Product! 🎁" if real_stock_available else f"📦 Preorder (FREE)"
         else:
-            button_text = f"🛒 Buy Now — ${_money(product.price):.2f}" if real_stock_available else f"📦 Preorder — ${_money(product.price):.2f}"
+            button_text = f"🛒 Buy Now — ${display_price:.2f}" if real_stock_available else f"📦 Preorder — ${display_price:.2f}"
         button_style = "success" if real_stock_available else "primary"
         buttons.append([
             InlineKeyboardButton(text=button_text, callback_data=f"select_qty_{product_id}", style=button_style)
         ])
-        if real_stock_available and max_qty >= 1:
-            text += f"\n💡 <b>Quick Buy:</b> You can buy up to <b>{max_qty}</b> units."
+        if real_stock_available and max_qty >= 1 and not is_free:
+            quick_buy_qty = f"{max_qty}" if max_qty < 999999 else "available"
+            text += f"\n💡 <b>Quick Buy:</b> You can buy {quick_buy_qty} units."
 
     fav_label = "⭐ Remove from Favorites" if is_fav else "☆ Add to Favorites"
     fav_style = "danger" if is_fav else "success"
@@ -1146,10 +1496,10 @@ async def product_info(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              QUANTITY INPUT + CONFIRM                       ║
+# ║             QUANTITY INPUT + CONFIRM                         ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def _qty_text(product, qty: int, real_stock_available: bool) -> str:
+def _qty_text(product, qty: int, real_stock_available: bool, custom_price: Decimal | None = None) -> str:
     is_free = float(product.price) == 0
 
     if is_free:
@@ -1170,10 +1520,10 @@ def _qty_text(product, qty: int, real_stock_available: bool) -> str:
             f"<i>Confirm below to claim your free product.</i>"
         )
 
-    actual_price = _money(product.price)
+    actual_price = _money(custom_price if custom_price is not None else product.price)
     discount_note = ""
 
-    if product.bulk_pricing:
+    if custom_price is None and product.bulk_pricing:
         bulk_price = _get_bulk_price(product.bulk_pricing, qty)
         if bulk_price is not None:
             actual_price = _money(bulk_price)
@@ -1206,13 +1556,17 @@ def _qty_text(product, qty: int, real_stock_available: bool) -> str:
 
 def _confirm_keyboard(product_id: int, is_free: bool = False) -> InlineKeyboardMarkup:
     confirm_text = "🎁 Claim Now! 🎁" if is_free else "✅ Confirm Purchase"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=confirm_text, callback_data=f"confirm_buy_{product_id}", style="success")],
+    buttons = [[InlineKeyboardButton(text=confirm_text, callback_data=f"confirm_buy_{product_id}", style="success")]]
+
+    if not is_free:
+        buttons.append(
             [InlineKeyboardButton(text="🔄 Change Quantity", callback_data=f"select_qty_{product_id}", style="primary"),
-             InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_buy_{product_id}", style="danger")]
-        ]
-    )
+             InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_buy_{product_id}", style="danger")])
+    else:
+        buttons.append(
+            [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_buy_{product_id}", style="danger")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def _cancel_input_keyboard(product_id: int) -> InlineKeyboardMarkup:
@@ -1228,61 +1582,65 @@ def _cancel_input_keyboard(product_id: int) -> InlineKeyboardMarkup:
 async def select_qty(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     product_id = int(callback.data.split("_")[2])
+
+    await _refresh_reseller_stock_cache_if_needed()
     product = await asyncio.to_thread(_fetch_product, product_id)
+    custom_price = await asyncio.to_thread(_get_custom_price, callback.from_user.id, product_id)
 
     if not product or not product.is_active:
         await show(callback, f"⚠️ <b>Product Unavailable</b>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")]
-            ]))
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                       [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")]
+                   ]))
         return
 
     max_qty = _get_max_qty(product)
     if max_qty <= 0:
         await show(callback,
-                   f"❌ <b>OUT OF STOCK</b>\n\n<b>This product is currently unavailable.</b>",            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🛍 Browse Other Products", callback_data="products_menu", style="success")],
-                [InlineKeyboardButton(text="🔔 Notify When Available", callback_data=f"notify_available_{product_id}", style="primary")]
-            ]))
+                   f"❌ <b>OUT OF STOCK</b>\n\n<b>This product is currently unavailable.</b>",
+                   parse_mode="HTML",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                       [InlineKeyboardButton(text="🛍 Browse Other Products", callback_data="products_menu",
+                                            style="success")],
+                       [InlineKeyboardButton(text="🔔 Notify When Available",
+                                            callback_data=f"notify_available_{product_id}", style="primary")]
+                   ]))
         return
 
-    cat_config = _get_category_config(product.category)
-    range_text = "1" if max_qty == 1 else f"1 to {max_qty}"
     is_free = float(product.price) == 0
 
     if is_free:
-        text = (
-            f"🎁 <b>CLAIM FREE PRODUCT</b>\n\n"
-            f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
-            f"🎁 <b>Price:</b> FREE! 🎉\n"
-            f"📦 <b>Available:</b> {max_qty} units\n\n"
-            f"{_divider('─', 28)}\n\n"
-            f"🔢 <b>How many would you like?</b>\n\n"
-            f"Reply with a number ({range_text})"
-        )
-    else:
-        has_bulk = bool(product.bulk_pricing)
-        bulk_info = ""
-        if has_bulk:
-            bulk_info = "\n📦 <b>💰 Bulk Discounts Available!</b>\n"
-            bulk_tiers = _format_bulk_pricing_text(product.bulk_pricing)
-            bulk_info += bulk_tiers
-            bulk_info += "\n\n<i>The price adjusts automatically based on your quantity!</i>"
+        await state.update_data(**{f"qty_{product_id}": 1})
+        real_stock_available = _real_stock(product) > 0
+        await show(callback, _qty_text(product, 1, real_stock_available, custom_price),
+                   parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free=True))
+        return
 
-        text = (
-            f"🔢 <b>SELECT QUANTITY</b>\n\n"
-            f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
-            f"💰 <b>Base Price:</b> ${_money(product.price):.2f} each\n"
-            f"📦 <b>Available:</b> {max_qty} units\n"
-            f"{bulk_info}\n"
-            f"{_divider('─', 28)}\n\n"
-            f"🔢 <b>How many would you like?</b>\n\n"
-            f"Reply with a number ({range_text})"
-        )
+    cat_config = _get_category_config(product.category)
+    range_text = "1" if max_qty == 1 else (f"1 to {max_qty}" if max_qty < 999999 else "1 or more")
 
-    if max_qty > 1:
-        text += f"\n\n<i>Example: Send 3 for three units</i>"
+    stock_disp = "In Stock" if max_qty >= 999999 else f"{max_qty} units"
+
+    has_bulk = bool(product.bulk_pricing) and custom_price is None
+    bulk_info = ""
+    if has_bulk:
+        bulk_info = "\n📦 <b>💰 Bulk Discounts Available!</b>\n"
+        bulk_tiers = _format_bulk_pricing_text(product.bulk_pricing)
+        bulk_info += bulk_tiers
+        bulk_info += "\n\n<i>The price adjusts automatically based on your quantity!</i>"
+
+    text = (
+        f"🔢 <b>SELECT QUANTITY</b>\n\n"
+        f"<b>{product.icon or cat_config['icon']} {product.name}</b>\n"
+        f"💰 <b>{'Custom' if custom_price is not None else 'Base'} Price:</b> ${_money(custom_price if custom_price is not None else product.price):.2f} each\n"
+        f"📦 <b>Available:</b> {stock_disp}\n"
+        f"{bulk_info}\n"
+        f"{_divider('─', 28)}\n\n"
+        f"🔢 <b>How many would you like?</b>\n\n"
+        f"Reply with a number ({range_text})"
+    )
+
+    text += f"\n\n<i>Example: Send 3 for three units</i>"
 
     await state.set_state(PurchaseStates.waiting_qty)
     await state.update_data(pending_product_id=product_id)
@@ -1299,53 +1657,66 @@ async def receive_qty(message: Message, state: FSMContext):
     if product_id is None:
         await state.clear()
         await update_card(message, None, f"⚠️ <b>Session Expired</b>\n\nPlease start over from the product page.",
-            chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="primary")]
-            ]))
+                          chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                              [InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="primary")]
+                          ]))
         return
 
+    await _refresh_reseller_stock_cache_if_needed()
     product = await asyncio.to_thread(_fetch_product, product_id)
+    custom_price = await asyncio.to_thread(_get_custom_price, message.from_user.id, product_id)
+
     if not product or not product.is_active:
         await state.clear()
         await update_card(message, None, f"⚠️ <b>Product Unavailable</b>",
-            chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="primary")]
-            ]))
+                          chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                              [InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="primary")]
+                          ]))
+        return
+
+    is_free = float(product.price) == 0
+    if is_free:
+        await state.update_data(**{f"qty_{product_id}": 1})
+        real_stock_available = _real_stock(product) > 0
+        await update_card(message, state, _qty_text(product, 1, real_stock_available, custom_price),
+                          parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free=True))
         return
 
     max_qty = _get_max_qty(product)
     if max_qty <= 0:
         await state.clear()
         await update_card(message, None, f"❌ <b>Out of Stock</b>",
-            chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")]
-            ]))
+                          chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                              [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu",
+                                                   style="primary")]
+                          ]))
         return
 
     raw = message.text.strip()
     if not raw.isdigit():
+        range_msg = f"1 to {max_qty}" if max_qty < 999999 else "1 or more"
         await update_card(message, state,
-            f"⚠️ <b>Invalid Input</b>\n\n{_divider('─', 24)}\n\n❌ Please send a whole number.\n\n"
-            f"<b>Valid range:</b> 1 to {max_qty}\n\n<i>Example: 1 or 3 or {max_qty}</i>",
-            parse_mode="HTML", reply_markup=_cancel_input_keyboard(product_id))
+                          f"⚠️ <b>Invalid Input</b>\n\n{_divider('─', 24)}\n\n❌ Please send a whole number.\n\n"
+                          f"<b>Valid range:</b> {range_msg}\n\n<i>Example: 1 or 3</i>",
+                          parse_mode="HTML", reply_markup=_cancel_input_keyboard(product_id))
         return
 
     qty = int(raw)
-    if qty < 1 or qty > max_qty:
+    if qty < 1 or (max_qty < 999999 and qty > max_qty):
+        range_msg = f"1 and {max_qty}" if max_qty < 999999 else "at least 1"
         await update_card(message, state,
-            f"⚠️ <b>Out of Range</b>\n\n{_divider('─', 24)}\n\n❌ Quantity must be between <b>1</b> and <b>{max_qty}</b>.\n\n"
-            f"You entered: <b>{qty}</b>\n\n<i>Please try again.</i>",
-            parse_mode="HTML", reply_markup=_cancel_input_keyboard(product_id))
+                          f"⚠️ <b>Out of Range</b>\n\n{_divider('─', 24)}\n\n❌ Quantity must be between {range_msg}.\n\n"
+                          f"You entered: <b>{qty}</b>\n\n<i>Please try again.</i>",
+                          parse_mode="HTML", reply_markup=_cancel_input_keyboard(product_id))
         return
 
     await state.update_data(**{f"qty_{product_id}": qty})
     real_stock_available = _real_stock(product) > 0
-    is_free = float(product.price) == 0
-    await update_card(message, state, _qty_text(product, qty, real_stock_available),
-        parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free))
+    await update_card(message, state, _qty_text(product, qty, real_stock_available, custom_price),
+                      parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free))
 
 
 @router.callback_query(F.data.startswith("cancel_buy_"))
@@ -1355,19 +1726,25 @@ async def cancel_buy(callback: CallbackQuery, state: FSMContext):
     await state.update_data(**{f"qty_{product_id}": 1})
     await state.clear()
     await show(callback,
-               f"❌ <b>CANCELLED</b>\n\n<b>Purchase cancelled.</b>\n\nYour balance has not been charged.",        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success"),
-             InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-        ]))
+               f"❌ <b>CANCELLED</b>\n\n<b>Purchase cancelled.</b>\n\nYour balance has not been charged.",
+               parse_mode="HTML",
+               reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                   [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="success"),
+                    InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+               ]))
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              PURCHASE TRANSACTION                           ║
+# ║             OWN PRODUCT PURCHASE TRANSACTION                 ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @retry_on_write_conflict(max_attempts=3)
-def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
+def _do_purchase(
+    telegram_id: int,
+    product_id: int,
+    quantity: int,
+    delivery_telegram_id: int | None = None,
+) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
         if not user:
@@ -1380,21 +1757,19 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
             return {"error": "Product not found."}
         if not product.is_active:
             return {"error": "Product unavailable."}
-        if quantity < 1:
-            return {"error": "Quantity must be at least 1."}
 
-        # 🎁 Freebie limit: one claim per user per free product
         if float(product.price) == 0:
+            quantity = 1
             already_claimed = (
-                db.query(Order)
-                .filter(
-                    Order.telegram_id == telegram_id,
-                    Order.product_id == product.id,
-                    Order.status.in_(["completed", "pending_manual", "preorder"]),
-                    Order.refunded == False
-                )
-                .count()
-            ) > 0
+                                      db.query(Order)
+                                      .filter(
+                                          Order.telegram_id == telegram_id,
+                                          Order.product_id == product.id,
+                                          Order.status.in_(["completed", "pending_manual", "preorder"]),
+                                          Order.refunded == False
+                                      )
+                                      .count()
+                              ) > 0
             if already_claimed:
                 return {
                     "error": (
@@ -1405,9 +1780,17 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
                     )
                 }
 
-        # Apply bulk pricing if applicable
-        price = _money(product.price)
-        if product.bulk_pricing:
+        if quantity < 1:
+            return {"error": "Quantity must be at least 1."}
+
+        if delivery_telegram_id is not None and delivery_telegram_id <= 0:
+            return {"error": "delivery_telegram_id must be a positive Telegram user ID."}
+
+        # Final checkout reads the live rule, so a stopped rate cannot be
+        # used from an already-open product or confirmation screen.
+        custom_price = _active_custom_price(db, telegram_id, product.id)
+        price = custom_price if custom_price is not None else _money(product.price)
+        if custom_price is None and product.bulk_pricing:
             bulk_price = _get_bulk_price(product.bulk_pricing, quantity)
             if bulk_price is not None:
                 price = _money(bulk_price)
@@ -1423,6 +1806,13 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
             }
 
         delivery_type = (product.delivery_type or "automatic").lower()
+        if delivery_telegram_id is not None and delivery_type != "manual":
+            return {
+                "error": (
+                    "delivery_telegram_id can be used only with a product "
+                    "whose delivery type is manual."
+                )
+            }
         threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
 
         accounts = _accounts(product)
@@ -1463,7 +1853,8 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
             telegram_id=user.telegram_id, product_id=product.id, product_name=product.name,
             delivered_account="\n".join(delivered_accounts) if delivered_accounts else None,
             amount=total_amount, quantity=quantity, delivery_type=delivery_type,
-            is_preorder=is_preorder_order, status=status, refunded=False
+            is_preorder=is_preorder_order, status=status, refunded=False,
+            delivery_telegram_id=delivery_telegram_id,
         )
         db.add(order)
         db.flush()
@@ -1481,28 +1872,211 @@ def _do_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
 
         low_stock_alert = None
         if not is_preorder_order and stock_before > threshold >= new_stock:
-            low_stock_alert = {"product_id": product.id, "product_name": product.name, "stock": new_stock, "threshold": threshold}
+            low_stock_alert = {"product_id": product.id, "product_name": product.name, "stock": new_stock,
+                               "threshold": threshold}
 
-        # 🆕 Include delivery_instruction in result
         result = {
             "order_id": order.id, "icon": product.icon, "name": product.name,
             "delivered_accounts": delivered_accounts, "balance": user.balance,
             "stock": new_stock, "status": status, "is_preorder": is_preorder_order,
             "quantity": quantity, "total_price": total_amount, "price_per_unit": price,
             "low_stock_alert": low_stock_alert, "referral_commission_paid": referral_commission_paid,
-            "delivery_instruction": product.delivery_instruction,  # 🆕
+            "delivery_instruction": product.delivery_instruction,
         }
     return result
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║          RESELLER PURCHASE TRANSACTION (FINANCIAL SAFETY)    ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+async def _do_reseller_purchase(telegram_id: int, product_id: int, quantity: int) -> dict:
+    if not ResellerManager:
+        return {"error": "Reseller integration module is unavailable."}
+
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if not product or not product.is_active:
+            return {"error": "Product is no longer available."}
+
+        if float(product.price) == 0:
+            quantity = 1
+
+        if getattr(product, "source", "own") != "reseller":
+            return {"error": "Invalid product source."}
+
+        service_id = str(getattr(product, "reseller_service_id", "") or "").strip()
+        if not service_id:
+            return {"error": "Product configuration error (missing reseller service ID). Customer not charged."}
+
+        await _refresh_reseller_stock_cache_if_needed()
+        db_stock = getattr(product, "stock", 0)
+        fallback_stk = db_stock if (db_stock is not None and db_stock > 0) else 999999
+        available_stock = _reseller_stock_cache.get(service_id, fallback_stk)
+
+        if available_stock > 0 and available_stock < quantity:
+            return {"error": f"Only {available_stock} left in stock with supplier."}
+
+        custom_price = _active_custom_price(db, telegram_id, product.id)
+        price = custom_price if custom_price is not None else _money(product.price)
+        if custom_price is None and product.bulk_pricing:
+            bulk_price = _get_bulk_price(product.bulk_pricing, quantity)
+            if bulk_price is not None:
+                price = _money(bulk_price)
+
+        total_amount = _money(price * quantity)
+
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if not user:
+            return {"error": "User not found."}
+        if getattr(user, "is_banned", False):
+            return {"error": "Your account is banned from making purchases."}
+
+        user_balance = _money(user.balance)
+        if user_balance < total_amount:
+            return {
+                "error": "insufficient_balance",
+                "total_price": float(total_amount),
+                "balance": float(user_balance)
+            }
+
+        product_name = product.name
+        product_icon = product.icon
+        delivery_instruction = product.delivery_instruction
+        prov_id = getattr(product, "provider_id", None) or getattr(product, "reseller_name", None)
+    finally:
+        db.close()
+
+    creds = _get_reseller_credentials(prov_id)
+    api_key = creds["api_key"]
+    base_url = creds["base_url"]
+
+    if not api_key or not base_url:
+        return {"error": "Reseller service is not configured properly."}
+
+    external_order_id = f"ORD-{telegram_id}-{int(time.time())}"
+
+    try:
+        manager = ResellerManager(api_key=api_key, base_url=base_url, provider_config=creds)
+        api_response = await _call_reseller_place_order(
+            manager,
+            service_id=service_id,
+            quantity=quantity,
+            external_order_id=external_order_id
+        )
+    except ResellerAPIError as e:
+        status_code = getattr(e, "status_code", 0)
+        err_detail = str(e)
+        logger.error("ResellerAPIError during purchase (status %s):\n%s", status_code, err_detail)
+
+        return {"error": f"❌ Provider Error ({status_code}): {err_detail}"}
+    except Exception as e:
+        logger.exception("Unexpected error ordering from reseller API")
+        return {"error": f"❌ Supplier service error: {str(e)}"}
+
+    delivered_list = []
+    if isinstance(api_response, dict):
+        raw_products = (
+                api_response.get("delivery_items") or
+                api_response.get("delivery") or
+                api_response.get("products") or
+                api_response.get("code") or
+                api_response.get("account") or
+                api_response.get("accounts") or
+                api_response.get("data") or
+                api_response.get("credentials") or
+                api_response.get("result") or
+                api_response.get("delivered_account") or
+                api_response.get("items")
+        )
+        if isinstance(raw_products, str):
+            delivered_list = [raw_products]
+        elif isinstance(raw_products, list):
+            delivered_list = [str(p) for p in raw_products if p]
+    elif isinstance(api_response, list):
+        delivered_list = [str(p) for p in api_response if p]
+    elif isinstance(api_response, str):
+        delivered_list = [api_response]
+
+    if not delivered_list:
+        logger.error("Reseller API returned success but no products/codes: %s", api_response)
+        return {"error": "❌ Supplier returned no product codes. Your balance was not charged."}
+
+    def _finalize_db_transaction():
+        with transaction() as db:
+            u = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
+            if not u:
+                raise Exception("User not found during transaction commit")
+
+            u.balance = _money(u.balance) - total_amount
+            u.total_orders += 1
+            u.total_spent = _money(u.total_spent) + total_amount
+
+            delivered_text = "\n".join(delivered_list)
+
+            order = Order(
+                telegram_id=u.telegram_id,
+                product_id=product_id,
+                product_name=product_name,
+                delivered_account=delivered_text,
+                amount=total_amount,
+                quantity=quantity,
+                delivery_type="automatic",
+                is_preorder=False,
+                status="completed",
+                refunded=False
+            )
+            db.add(order)
+            db.flush()
+
+            referral_commission_paid = None
+            if u.referred_by:
+                referrer = db.query(User).filter(User.telegram_id == u.referred_by).with_for_update().first()
+                if referrer is not None:
+                    commission = _money(total_amount * REFERRAL_COMMISSION_RATE)
+                    if commission > 0:
+                        referrer.referral_earnings = _money(referrer.referral_earnings) + commission
+                        if REFERRAL_CREDIT_TO_BALANCE:
+                            referrer.balance = _money(referrer.balance) + commission
+                        referral_commission_paid = {"referrer_telegram_id": referrer.telegram_id, "amount": commission}
+
+            stock_left = _reseller_stock_cache.get(service_id, fallback_stk)
+            stock_disp = "In Stock" if stock_left >= 999999 else stock_left
+
+            return {
+                "order_id": order.id,
+                "icon": product_icon,
+                "name": product_name,
+                "delivered_accounts": delivered_list,
+                "balance": u.balance,
+                "stock": stock_disp,
+                "status": "completed",
+                "is_preorder": False,
+                "quantity": quantity,
+                "total_price": total_amount,
+                "price_per_unit": price,
+                "low_stock_alert": None,
+                "referral_commission_paid": referral_commission_paid,
+                "delivery_instruction": delivery_instruction,
+            }
+
+    try:
+        result = await asyncio.to_thread(_finalize_db_transaction)
+        return result
+    except Exception:
+        logger.exception("Error finalizing local order after successful reseller order")
+        return {"error": "❌ Order processing error. Please contact support with your purchase details."}
 
 
 async def _notify_admins_low_stock(bot, alert: dict):
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id,
-                f"⚠️ <b>LOW STOCK ALERT</b>\n\n{_divider('─', 24)}\n\n"
-                f"📦 <b>Product:</b> {alert['product_name']}\n🆔 <b>ID:</b> #{alert['product_id']}\n"
-                f"📊 <b>Remaining:</b> {alert['stock']}\n🔔 <b>Threshold:</b> {alert['threshold']}\n\n"
-                f"⚡ <i>Stock has dropped below the alert threshold.</i>", parse_mode="HTML")
+                                   f"⚠️ <b>LOW STOCK ALERT</b>\n\n{_divider('─', 24)}\n\n"
+                                   f"📦 <b>Product:</b> {alert['product_name']}\n🆔 <b>ID:</b> #{alert['product_id']}\n"
+                                   f"📊 <b>Remaining:</b> {alert['stock']}\n🔔 <b>Threshold:</b> {alert['threshold']}\n\n"
+                                   f"⚡ <i>Stock has dropped below the alert threshold.</i>", parse_mode="HTML")
         except Exception:
             logger.exception("Failed to notify admin %s of low stock", admin_id)
 
@@ -1512,22 +2086,22 @@ async def _notify_admins_pending_order(bot, buyer_id: int, result: dict):
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id,
-                f"🆕 <b>NEW {kind.upper()}</b>\n\n{_divider('─', 24)}\n\n"
-                f"🆔 <b>Order:</b> #{result['order_id']}\n👤 <b>Buyer ID:</b> <code>{buyer_id}</code>\n"
-                f"📦 <b>Product:</b> {result['name']}\n🔢 <b>Quantity:</b> {result['quantity']}x\n"
-                f"💰 <b>Total:</b> ${result['total_price']:.2f}\n\n"
-                f"📋 <b>Action Required:</b>\nAdmin → Orders → #{result['order_id']} → Deliver", parse_mode="HTML")
+                                   f"🆕 <b>NEW {kind.upper()}</b>\n\n{_divider('─', 24)}\n\n"
+                                   f"🆔 <b>Order:</b> #{result['order_id']}\n👤 <b>Buyer ID:</b> <code>{buyer_id}</code>\n"
+                                   f"📦 <b>Product:</b> {result['name']}\n🔢 <b>Quantity:</b> {result['quantity']}x\n"
+                                   f"💰 <b>Total:</b> ${result['total_price']:.2f}\n\n"
+                                   f"📋 <b>Action Required:</b>\nAdmin → Orders → #{result['order_id']} → Deliver",
+                                   parse_mode="HTML")
         except Exception:
             logger.exception("Failed to notify admin %s of pending order", admin_id)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║         DELIVERY INSTRUCTION BUTTON HANDLER 🆕              ║
+# ║          DELIVERY INSTRUCTION BUTTON HANDLER                 ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("delivery_instruction_"))
 async def show_delivery_instruction(callback: CallbackQuery):
-    """Show delivery instruction when user clicks the button after purchase."""
     await callback.answer()
     product_id = int(callback.data.split("_")[2])
     product = await asyncio.to_thread(_fetch_product, product_id)
@@ -1540,13 +2114,13 @@ async def show_delivery_instruction(callback: CallbackQuery):
 
     text = (
         f"╔{'═' * 30}╗\n"
-        f"║  📋 DELIVERY INSTRUCTIONS      ║\n"
+        f"║  📋 DELIVERY INSTRUCTIONS       ║\n"
         f"╚{'═' * 30}╝\n\n"
         f"<b>{product.icon or cat_config['icon']} {_esc(product.name)}</b>\n\n"
         f"{'─' * 30}\n\n"
         f"<b>⚠️ IMPORTANT — READ CAREFULLY:</b>\n\n"
         f"<blockquote>{_esc(product.delivery_instruction)}</blockquote>\n\n"
-        f"{'═' * 30}\n\n"
+        f"{'─' * 30}\n\n"
         f"<i>💡 Please follow these instructions carefully\n"
         f"to ensure a smooth experience.</i>\n\n"
         f"<i>If you have any issues, contact support!</i>"
@@ -1566,7 +2140,7 @@ async def show_delivery_instruction(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              CONFIRM PURCHASE                               ║
+# ║              CONFIRM PURCHASE                                ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("confirm_buy_"))
@@ -1584,23 +2158,44 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         quantity = data.get(f"qty_{product_id}", 1)
 
+        product = await asyncio.to_thread(_fetch_product, product_id)
+        if not product or not product.is_active:
+            await show(callback, f"❌ <b>NOT FOUND</b>\n\n<b>This product is no longer available.</b>",
+                       parse_mode="HTML",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                           [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu",
+                                                 style="primary")]
+                       ]))
+            return
+
+        if float(product.price) == 0:
+            quantity = 1
+
+        is_reseller = getattr(product, "source", "own") == "reseller"
+
         try:
-            result = await asyncio.to_thread(_do_purchase, telegram_id, product_id, quantity)
+            if is_reseller:
+                result = await _do_reseller_purchase(telegram_id, product_id, quantity)
+            else:
+                result = await asyncio.to_thread(_do_purchase, telegram_id, product_id, quantity)
         except SQLAlchemyError:
             logger.exception("Database error during purchase")
-            await show(callback, f"❌ <b>Database Error</b>\n\nSomething went wrong. Please try again.", parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Try Again", callback_data=f"product_{product_id}", style="primary"),
-                     InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-                ]))
+            await show(callback, f"❌ <b>Database Error</b>\n\nSomething went wrong. Please try again.",
+                       parse_mode="HTML",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                           [InlineKeyboardButton(text="🔄 Try Again", callback_data=f"product_{product_id}",
+                                                 style="primary"),
+                            InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+                       ]))
             return
         except Exception:
             logger.exception("Unexpected error during purchase")
-            await show(callback, f"❌ <b>Unexpected Error</b>\n\nPlease try again or contact support.", parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🆘 Support", callback_data="support_menu", style="danger"),
-                     InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-                ]))
+            await show(callback, f"❌ <b>Unexpected Error</b>\n\nPlease try again or contact support.",
+                       parse_mode="HTML",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                           [InlineKeyboardButton(text="🆘 Support", callback_data="support_menu", style="danger"),
+                            InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
+                       ]))
             return
 
         await state.update_data(**{f"qty_{product_id}": 1})
@@ -1624,12 +2219,12 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     f"   💳 <b>Your Balance:</b> <code>${balance:.2f}</code>\n\n"
                     f"{'─' * 30}\n\n"
                     f"💡 <b>What would you like to do?</b>\n\n"
-                    f"  🏦 <b>Deposit Funds</b> — Add money to\n"
-                    f"     your wallet and try again.\n\n"
-                    f"  🛍 <b>Browse Products</b> — Find\n"
-                    f"     something within your budget.\n\n"
-                    f"  🏠 <b>Main Menu</b> — Go back to\n"
-                    f"     the dashboard.\n\n"
+                    f"   🏦 <b>Deposit Funds</b> — Add money to\n"
+                    f"      your wallet and try again.\n\n"
+                    f"   🛍 <b>Browse Products</b> — Find\n"
+                    f"      something within your budget.\n\n"
+                    f"   🏠 <b>Main Menu</b> — Go back to\n"
+                    f"      the dashboard.\n\n"
                     f"{'─' * 30}\n\n"
                     f"⚡ <i>Quick Tip: Top up your balance\n"
                     f"with crypto or fiat in seconds!</i>"
@@ -1664,7 +2259,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     f"╔{'═' * 30}╗\n"
                     f"║  ❌ PURCHASE FAILED             ║\n"
                     f"╚{'═' * 30}╝\n\n"
-                    f"⚠️ <b>{error_msg}</b>\n\n"
+                    f"⚠️ <b>{_esc(error_msg)}</b>\n\n"
                     f"{'─' * 30}\n\n"
                     f"💡 <i>If you need help, contact\n"
                     f"our support team anytime!</i>"
@@ -1696,7 +2291,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
             await show(callback, text, parse_mode="HTML", reply_markup=reply_markup)
             return
 
-        # Group notification (purchase / deposit channel — config.GROUP_ID)
+        # Group notification
         if GROUP_NOTIFICATIONS and GROUP_ID:
             try:
                 now = datetime.now().strftime("%d-%b-%Y %I:%M %p IST")
@@ -1707,12 +2302,12 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     "<code>$ journalctl --wallet</code>\n"
                     "<code>New wallet event detected.</code>\n"
                     "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-                    f"<code>ACTION      PURCHASE</code>\n"
-                    f"<code>USER        {masked_uid}</code>\n"
-                    f"<code>PRODUCT     {result['name']}</code>\n"
-                    f"<code>AMOUNT      ${result['total_price']:.2f}</code>\n"
-                    f"<code>ORDER       #{result['order_id']}</code>\n"
-                    f"<code>TIME        {now}</code>\n"
+                    f"<code>ACTION     PURCHASE</code>\n"
+                    f"<code>USER       {masked_uid}</code>\n"
+                    f"<code>PRODUCT    {result['name']}</code>\n"
+                    f"<code>AMOUNT     ${result['total_price']:.2f}</code>\n"
+                    f"<code>ORDER      #{result['order_id']}</code>\n"
+                    f"<code>TIME       {now}</code>\n"
                     "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
                     "<code>Wallet synchronized.</code>"
                 )
@@ -1727,7 +2322,6 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
         is_free = float(result.get("total_price", 0)) == 0
         delivery_instruction = result.get("delivery_instruction")
 
-        # Helper: Build all reply_markup buttons with optional delivery instruction button
         def _build_success_keyboard(product_id: int, has_instruction: bool) -> InlineKeyboardMarkup:
             buttons = []
             if has_instruction:
@@ -1748,13 +2342,14 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
             return InlineKeyboardMarkup(inline_keyboard=buttons)
 
         if result["status"] == "completed":
-            joined_accounts = "\n".join(f"  {i + 1}. <code>{acc}</code>" for i, acc in enumerate(result["delivered_accounts"]))
+            joined_accounts = "\n".join(
+                f"  {i + 1}. <code>{acc}</code>" for i, acc in enumerate(result["delivered_accounts"]))
             has_instr = bool(delivery_instruction)
 
             if is_free:
                 text = (
                     f"╔{'═' * 34}╗\n"
-                    f"║  🎁 FREEBIE CLAIMED!           ║\n"
+                    f"║  🎁 FREEBIE CLAIMED!            ║\n"
                     f"╚{'═' * 34}╝\n\n"
                     f"🎉 <b>Your free product has been delivered!</b>\n\n"
                     f"{'─' * 34}\n\n"
@@ -1766,7 +2361,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     f"🔑 <b>Your Accounts:</b>\n\n{joined_accounts}\n\n"
                     f"{'═' * 34}\n\n"
                     f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>\n"
-                    f"📦 <b>Stock Left:</b> {result['stock']} units\n\n"
+                    f"📦 <b>Stock Left:</b> {result['stock']}\n\n"
                     f"<i>Enjoy your free product! 🎉</i>"
                 )
                 if has_instr:
@@ -1786,7 +2381,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     f"🔑 <b>Your Accounts:</b>\n\n{joined_accounts}\n\n"
                     f"{'═' * 34}\n\n"
                     f"💳 <b>Remaining Balance:</b> <code>${result['balance']:.2f}</code>\n"
-                    f"📦 <b>Stock Left:</b> {result['stock']} units\n\n"
+                    f"📦 <b>Stock Left:</b> {result['stock']}\n\n"
                     f"<i>Thank you for your purchase! 🙏</i>"
                 )
                 if has_instr:
@@ -1837,7 +2432,6 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
             ])
         else:
-            # pending_manual status
             has_instr = bool(delivery_instruction)
 
             if is_free:
@@ -1879,16 +2473,17 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     f"<i>Our team is on it! 🚀</i>"
                 )
 
-            # Build keyboard with optional delivery instruction button
             pending_buttons = [
                 [InlineKeyboardButton(text="📜 Track Order", callback_data="orders_menu", style="primary"),
                  InlineKeyboardButton(text="🆘 Support", callback_data="support_menu", style="danger")],
             ]
             if has_instr:
                 pending_buttons.insert(0, [
-                    InlineKeyboardButton(text="📋 📖 Delivery Instructions", callback_data=f"delivery_instruction_{product_id}", style="primary")
+                    InlineKeyboardButton(text="📋 📖 Delivery Instructions",
+                                          callback_data=f"delivery_instruction_{product_id}", style="primary")
                 ])
-            pending_buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")])
+            pending_buttons.append(
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")])
             reply_markup = InlineKeyboardMarkup(inline_keyboard=pending_buttons)
 
         await show(callback, text, parse_mode="HTML", reply_markup=reply_markup)
@@ -1906,8 +2501,121 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
         if commission:
             try:
                 await callback.bot.send_message(commission["referrer_telegram_id"],
-                    f"🎉 <b>Referral Commission Earned!</b>\n\n{_divider('─', 22)}\n\n"
-                    f"💵 <b>Amount:</b> ${commission['amount']:.2f}\n👤 <b>From:</b> A user you referred\n\n"
-                    f"<i>Thanks for sharing your link! 🙏</i>", parse_mode="HTML")
+                                                f"🎉 <b>Referral Commission Earned!</b>\n\n{_divider('─', 22)}\n\n"
+                                                f"💵 <b>Amount:</b> ${commission['amount']:.2f}\n👤 <b>From:</b> A user you referred\n\n"
+                                                f"<i>Thanks for sharing your link! 🙏</i>", parse_mode="HTML")
             except Exception:
                 logger.exception("Failed to notify referrer %s of commission", commission["referrer_telegram_id"])
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║          RESELLER PRODUCT IMPORT HANDLERS                    ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+async def _fetch_and_show_reseller_products(callback: CallbackQuery, reseller_id: str):
+    user_id = callback.from_user.id
+    lock_key = (user_id, str(reseller_id))
+
+    if lock_key in _reseller_import_locks:
+        await callback.answer("⏳ Products are already being fetched from this provider...", show_alert=True)
+        return
+
+    _reseller_import_locks.add(lock_key)
+    logger.info("IMPORT START user=%s provider=%s", user_id, reseller_id)
+
+    loading_message = await callback.message.answer("🔄 Fetching products...")
+
+    try:
+        db = SessionLocal()
+        try:
+            from handlers.admin_products import _get_provider_by_id
+            provider_config = _get_provider_by_id(db, str(reseller_id))
+        except Exception:
+            provider_config = None
+        finally:
+            db.close()
+
+        if not provider_config:
+            provider_config = _get_reseller_credentials(reseller_id)
+
+        api_key = provider_config.get("api_key")
+        base_url = provider_config.get("base_url")
+
+        if not api_key or not base_url:
+            await loading_message.edit_text("❌ Provider credentials not configured properly.")
+            return
+
+        manager = ResellerManager(
+            api_key=api_key,
+            base_url=base_url,
+            provider_config=provider_config
+        )
+
+        logger.info("API REQUEST user=%s provider=%s", user_id, reseller_id)
+        reseller_data = await _call_reseller_get_products(manager)
+        logger.info("API RESPONSE user=%s provider=%s", user_id, reseller_id)
+
+        services = []
+        if isinstance(reseller_data, list):
+            services = reseller_data
+        elif isinstance(reseller_data, dict):
+            services = (
+                reseller_data.get("services", [])
+                or reseller_data.get("products", [])
+                or reseller_data.get("data", [])
+            )
+
+        if not services:
+            await loading_message.edit_text("📭 No products found from this provider.")
+            return
+
+        text = (
+            f"🔗 <b>RESELLER PRODUCTS</b>\n\n"
+            f"<b>Provider:</b> {provider_config.get('name', 'Reseller')}\n"
+            f"<b>Available Items:</b> {len(services)}\n\n"
+            f"{_divider('─', 28)}\n\n"
+            f"<i>Select a product below to import or view:</i>"
+        )
+
+        keyboard = []
+        for s in services[:15]:
+            if isinstance(s, dict):
+                sid = s.get("service_id") or s.get("id") or "0"
+                sname = s.get("name") or s.get("title") or "Product"
+                sprice = s.get("rate") or s.get("price") or "0.00"
+                keyboard.append([
+                    InlineKeyboardButton(
+                        text=f"📦 {sname} — ${float(sprice):.2f}",
+                        callback_data=f"import_prov_{reseller_id}_{sid}",
+                        style="primary"
+                    )
+                ])
+
+        keyboard.append([
+            InlineKeyboardButton(text="🔙 Back to Providers", callback_data="admin_reseller_providers", style="primary"),
+            InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")
+        ])
+
+        await loading_message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+    except Exception as e:
+        logger.exception("Error fetching reseller products for provider %s", reseller_id)
+        try:
+            await loading_message.edit_text(f"❌ Error fetching products: {str(e)}")
+        except Exception:
+            pass
+    finally:
+        _reseller_import_locks.discard(lock_key)
+        logger.info("IMPORT END user=%s provider=%s", user_id, reseller_id)
+
+
+@router.callback_query(F.data.startswith("reseller:") | F.data.startswith("provider:"))
+async def reseller_selected(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    parts = callback.data.split(":", 1)
+    if len(parts) < 2:
+        return
+    reseller_id = parts[1]
+    await _fetch_and_show_reseller_products(callback, reseller_id)

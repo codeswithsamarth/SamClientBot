@@ -5,7 +5,11 @@ from models.product import Product
 from models.order import Order
 from models.deposit import Deposit
 from models.ticket import Ticket
-from models.referral import Referral  # ← ADD THIS LINE
+from models.referral import Referral
+from models.provider import Provider
+from models.custom_rate import CustomRate
+from models.rate_control import ProductRateControl, RateControlAssignment
+
 
 print("Creating tables...")
 

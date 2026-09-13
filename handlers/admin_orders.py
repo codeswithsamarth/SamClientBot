@@ -14,8 +14,10 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
-from config import ADMIN_IDS
+from config import ADMIN_IDS, DELIVERY_BOT_TOKEN
 from database import SessionLocal, transaction, retry_on_write_conflict
+from delivery_bot_app import delivery_bot
+from models.api_key import ApiOrder
 from models.order import Order
 from models.user import User
 from models.product import Product
@@ -402,14 +404,46 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
 
     order_id = int(callback.data.split("_")[2])
 
+    db = SessionLocal()
+    try:
+        order = db.get(Order, order_id)
+        is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
+        if order and (order.delivery_telegram_id or is_api_order) and not DELIVERY_BOT_TOKEN:
+            await callback.answer(
+                "DELIVERY_BOT_TOKEN is not configured. Add it before delivering this reseller manual order.",
+                show_alert=True,
+            )
+            return
+    finally:
+        db.close()
+
     await state.update_data(deliver_order_id=order_id)
     await state.set_state(DeliverOrder.content)
+
+    destination_note = ""
+    db = SessionLocal()
+    try:
+        order = db.get(Order, order_id)
+        is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
+        if order and order.delivery_telegram_id:
+            destination_note = (
+                "\n\n📨 This is a reseller-customer order. It will be sent by the "
+                "separate Delivery Bot to the supplied customer Telegram ID."
+            )
+        elif order and is_api_order:
+            destination_note = (
+                "\n\n👤 No customer Telegram ID was supplied. The Delivery Bot will "
+                "send the completed details only to you, so you can forward them yourself."
+            )
+    finally:
+        db.close()
 
     await callback.message.answer(
         "📤 Send the content to deliver to the buyer "
         "(account, key, or any message).\n\n"
         "It will be sent to them exactly as you type it, "
         "and the order will be marked completed."
+        + destination_note
     )
     await callback.answer()
 
@@ -474,6 +508,10 @@ def _do_deliver(order_id: int, delivered_text: str) -> dict:
         return {
             "order_id": order.id,
             "buyer_id": order.telegram_id,
+            "delivery_telegram_id": order.delivery_telegram_id,
+            "is_api_order": bool(
+                db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first()
+            ),
             "product_id": order.product_id,
             "product_name": order.product_name,
             "delivered_text": delivered_text,
@@ -563,7 +601,7 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             f"<i>Thank you for your patience! 🙏</i>"
         )
 
-        # Build keyboard with buttons
+        # Build keyboard with buttons for ordinary main-bot customers only.
         keyboard_buttons = []
         if has_instruction:
             keyboard_buttons.append([
@@ -586,16 +624,41 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")
         ])
 
-        await message.bot.send_message(
-            result["buyer_id"],
-            order_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-        )
+        is_api_manual = result["is_api_order"] and full_order.delivery_type == "manual"
+        if is_api_manual:
+            # An API reseller may optionally provide their end customer's ID.
+            # Without it, NEVER send codes to the API-key owner/customer: send
+            # them only to the administrator who is fulfilling this order.
+            destination_id = result["delivery_telegram_id"] or message.from_user.id
+            if not delivery_bot:
+                await message.answer(
+                    "⚠️ Order was marked delivered, but DELIVERY_BOT_TOKEN is not configured. "
+                    "Add it before delivering reseller manual orders."
+                )
+                return
+            recipient_label = "the customer" if result["delivery_telegram_id"] else "you (admin delivery copy)"
+            await delivery_bot.send_message(
+                destination_id,
+                ("📦 <b>Your order has been delivered</b>\n\n" if result["delivery_telegram_id"] else
+                 "📤 <b>Admin delivery copy</b>\n\nNo customer Telegram ID was supplied. Forward the details below yourself.\n\n") +
+                f"<b>Product:</b> {full_order.product_name}\n"
+                f"<b>Order:</b> #{full_order.id}\n\n"
+                f"🔑 <b>Delivered details:</b>\n<code>{result['delivered_text']}</code>",
+                parse_mode="HTML",
+            )
+            await message.answer(f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}.")
+        else:
+            destination_id = result["buyer_id"]
+            await message.bot.send_message(
+                destination_id,
+                order_text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+            )
     except Exception:
-        logger.exception("Failed to notify buyer %s of delivery", result["buyer_id"])
+        logger.exception("Failed to notify delivery recipient %s", result.get("delivery_telegram_id") or result["buyer_id"])
         await message.answer(
             "⚠️ Order marked delivered, but I couldn't message the "
-            "buyer directly (they may have blocked the bot)."
+            "recipient directly. They must start the correct bot before delivery."
         )
         return

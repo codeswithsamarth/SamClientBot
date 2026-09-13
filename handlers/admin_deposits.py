@@ -4,6 +4,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton
 )
+from decimal import Decimal, ROUND_HALF_UP
 
 from database import SessionLocal
 from config import ADMIN_IDS
@@ -14,6 +15,25 @@ router = Router()
 
 def is_admin(user_id: int):
     return user_id in ADMIN_IDS
+
+
+def _format_value(value, places: str) -> str:
+    try:
+        rounded = Decimal(str(value or 0)).quantize(Decimal(places), rounding=ROUND_HALF_UP)
+        return format(rounded, "f").rstrip("0").rstrip(".") or "0"
+    except Exception:
+        return "0"
+
+
+def _admin_deposit_amount(deposit) -> str:
+    if (deposit.network or "").upper() == "UPI" and deposit.status == "completed":
+        credited = _format_value(deposit.received_amount or deposit.amount, "0.001")
+        if deposit.inr_amount is not None:
+            return f"₹{_format_value(deposit.inr_amount, '0.01')} → ${credited}"
+        return f"${credited}"
+    if (deposit.network or "").upper() == "UPI":
+        return f"₹{_format_value(deposit.amount, '0.01')}"
+    return f"${_format_value(deposit.received_amount or deposit.amount, '0.001')}"
 
 
 # ==================================================
@@ -86,10 +106,11 @@ async def admin_deposits(
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        text=
-                        f"#{deposit.id} "
-                        f"{icon} "
-                        f"${float(deposit.amount):.2f}",
+                        text=(
+                            f"#{deposit.id} "
+                            f"{icon} "
+                            f"{_admin_deposit_amount(deposit)}"
+                        ),
 
                         callback_data=
                         f"deposit_{deposit.id}"
@@ -163,7 +184,7 @@ async def deposit_info(
 <code>{deposit.telegram_id}</code>
 
 💵 Amount:
-${float(deposit.amount):.2f}
+{_admin_deposit_amount(deposit)}
 
 🌐 Network:
 {deposit.network}
