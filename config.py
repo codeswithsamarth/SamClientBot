@@ -20,13 +20,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DELIVERY_BOT_TOKEN = os.getenv("DELIVERY_BOT_TOKEN", "")
 
 ADMIN_IDS = [
-    7943742895,
-    6502433991,
-    8312407391
+    1316577060,
+    7943742895
 ]
 
-CHANNEL_LINK = "https://t.me/ZDealsGroup"
-GROUP_LINK = "https://t.me/ZDealsStocks"
+CHANNEL_LINK = "https://t.me/RainOrdersGroup"
+GROUP_LINK = "https://t.me/RainStockGroup"
 TOS_LINK = "https://your-site.com/tos"
 
 GROUP_ID = -1003541834339
@@ -82,7 +81,7 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 # STOCK ALERTS
 # ==========================================================
 
-STOCK_GROUP_ID = -1003786859226
+STOCK_GROUP_ID = -1004396081675
 
 STOCK_NOTIFICATIONS = True
 
@@ -123,11 +122,11 @@ MYSQL_SSL_CA = os.getenv(
 # ==========================================================
 
 BEP20_ADDRESS = (
-    "0xe0289e12f6f653b5b8364b3ef197c8d078da5eef"
+    "0x573ff2eec518828332efce4267e585932c21f867"
 )
 
 POLYGON_ADDRESS = (
-    "0xe0289e12f6f653b5b8364b3ef197c8d078da5eef"
+    "0x573ff2eec518828332efce4267e585932c21f867"
 )
 
 
@@ -331,7 +330,7 @@ BINANCE_API_SECRET = os.getenv(
     "",
 )
 
-BINANCE_PAY_ID = "1244022263"
+BINANCE_PAY_ID = "45829163"
 
 BINANCE_PAY_LOOKBACK_DAYS = 7
 
@@ -385,7 +384,7 @@ DEPOSIT_CONFIRMATION_PROVIDER = "RPC"
 # DEPOSIT — UPI
 # ==========================================================
 
-UPI_ID = "7499899965@fam"
+UPI_ID = "luquman@fam"
 
 IMAP_HOST = "imap.gmail.com"
 
@@ -723,7 +722,7 @@ APP_TITLE = "Telegram Shop & Deposit Verification Bot"
 APP_DESCRIPTION = "Automated crypto and UPI deposit verification backend with live currency conversion."
 CONTACT_EMAIL = "support@arrsnetworkzone.in"
 LICENSE_TYPE = "Proprietary"
-ORGANIZATION_NAME = "ZDeals Enterprise"
+ORGANIZATION_NAME = "Rain Enterprise"
 TIMEZONE = "Asia/Kolkata"
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 EXTERNAL_WEBHOOK_TIMEOUT = 10
@@ -762,7 +761,7 @@ EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_USE_TLS = True
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
-DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "noreply@zdeals.com")
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "noreply@raindeals.com")
 SMS_GATEWAY_PROVIDER = "none"
 SMS_GATEWAY_API_KEY = os.getenv("SMS_GATEWAY_API_KEY", "")
 PUSH_NOTIFICATION_PROVIDER = "none"
@@ -792,24 +791,16 @@ X_XSS_PROTECTION = "1; mode=block"
 CONTENT_SECURITY_POLICY = "default-src 'self'"
 REFERRER_POLICY = "strict-origin-when-cross-origin"
 PERMISSIONS_POLICY = "geolocation=(), microphone=()"
-CACHE_KEY_PREFIX = "zdeals_cache:"
-SESSION_KEY_PREFIX = "zdeals_session:"
-RATE_LIMIT_KEY_PREFIX = "zdeals_rl:"
-LOCK_KEY_PREFIX = "zdeals_lock:"
-METRIC_KEY_PREFIX = "zdeals_metric:"
-QUEUE_KEY_PREFIX = "zdeals_queue:"
 EVENT_BUS_BACKEND = "local"
 EVENT_BUS_TOPICS = ["deposit.created", "deposit.completed", "deposit.failed"]
 FEATURE_FLAG_ANALYTICS_V2 = True
 FEATURE_FLAG_DYNAMIC_PRICING = False
 FEATURE_FLAG_WEBHOOK_RETRY = True
 SYSTEM_BOOT_TIME = os.getenv("SYSTEM_BOOT_TIME", "2026-01-01T00:00:00Z")
-APP_INSTANCE_ID = os.getenv("APP_INSTANCE_ID", "zdeals-instance-01")
-CLUSTER_ID = os.getenv("CLUSTER_ID", "zdeals-cluster-primary")
 DEPLOYMENT_REGION = os.getenv("DEPLOYMENT_REGION", "ap-south-1")
 INFRASTRUCTURE_PROVIDER = os.getenv("INFRASTRUCTURE_PROVIDER", "vercel")
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
-STORAGE_BUCKET_NAME = os.getenv("STORAGE_BUCKET_NAME", "zdeals-storage")
+STORAGE_BUCKET_NAME = os.getenv("STORAGE_BUCKET_NAME", "Rain-storage")
 STORAGE_REGION = os.getenv("STORAGE_REGION", "ap-south-1")
 CDN_BASE_URL = os.getenv("CDN_BASE_URL", "")
 CDN_ENABLED = False
@@ -848,9 +839,8 @@ LOYALTY_POINTS_PER_USD = 10
 LOYALTY_REDEMPTION_RATE = 0.01
 MARKETING_NEWSLETTER_ENABLED = False
 SUPPORT_TICKET_AUTO_CLOSE_DAYS = 7
-FAQ_BASE_URL = "https://t.me/ZDealsGroup"
-API_DOCS_URL = "https://t.me/ZDealsGroup"
-STATUS_PAGE_URL = "https://t.me/ZDealsGroup"
+FAQ_BASE_URL = "https://t.me/RainOrdersGroup"
+API_DOCS_URL = "https://t.me/RainOrdersGroup"
 FEEDBACK_EMAIL = "feedback@arrsnetworkzone.in"
 SECURITY_EMAIL = "security@arrsnetworkzone.in"
 ABUSE_EMAIL = "abuse@arrsnetworkzone.in"
@@ -877,7 +867,7 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_ACKS_LATE = True
 CELERY_TIMEZONE = "Asia/Kolkata"
 LOG_TO_FILE = True
-LOG_FILE_PATH = "logs/zdeals.log"
+LOG_FILE_PATH = "logs/RainDeals.log"
 LOG_MAX_FILE_SIZE_BYTES = 10485760
 LOG_BACKUP_COUNT = 5
 LOG_JSON_FORMAT = True

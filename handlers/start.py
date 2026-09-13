@@ -168,7 +168,7 @@ def _build_audit_profile(user, telegram_id: int) -> str:
         numeric_bal = 0.0
 
     return (
-        f"<code>┌──({username}㉿ZDeals)-[/audit]</code>\n"
+        f"<code>┌──({username}㉿Rain)-[/audit]</code>\n"
         f"<code>└─$ sudo profilectl audit</code>\n"
         f"<code>[sudo] password for {username}:</code>\n"
         f"<code>************</code>\n"
@@ -198,7 +198,7 @@ def _build_audit_profile(user, telegram_id: int) -> str:
         f"<code>Invite ID   {ref_code}</code>\n"
         f"<code>{_DASH_LINE}</code>\n"
         f"<code>Audit complete.</code>\n"
-        f"<code>root@ZDeals:~#</code>"
+        f"<code>root@Rain:~#</code>"
     )
 
 
@@ -217,7 +217,7 @@ def _build_start_welcome(user, full_name: str) -> str:
     first_name = full_name.split()[0] if full_name else "user"
 
     return (
-        "🛍 ZDeals Store\n"
+        "🛍 Rain Store\n"
         "Premium Digital Marketplace\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👋 Welcome back, {safe(first_name)}\n\n"

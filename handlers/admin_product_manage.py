@@ -81,7 +81,7 @@ def _build_stockctl_sync_text(product) -> str:
         status = "LIMITED STOCK"
 
     lines = [
-        "┌──(root㉿ZDeals)-[/inventory]",
+        "┌──(root㉿Rain)-[/inventory]",
         "└─# sudo stockctl sync",
         "Synchronizing inventory...",
         "[AUTH] Administrator Verified",
@@ -97,7 +97,7 @@ def _build_stockctl_sync_text(product) -> str:
         f"State       {status}",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "Inventory synchronized.",
-        "root@ZDeals:~#",
+        "root@Rain:~#",
     ]
     return "<pre>" + safe("\n".join(lines)) + "</pre>"
 

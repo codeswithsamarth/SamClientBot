@@ -732,7 +732,7 @@ def _stockctl_block(
     fields.append(("Status", status_label))
 
     lines = [
-        "┌──(root㉿ZDeals)-[/inventory]",
+        "┌──(root㉿Rain)-[/inventory]",
         f"└─# sudo stockctl {action}",
         "[sudo] password:",
         "************",
@@ -744,7 +744,7 @@ def _stockctl_block(
         lines.append(f"{label:<12}{value}")
     lines.append(_divider("━", 22))
     lines.append(closing)
-    lines.append("root@ZDeals:~#")
+    lines.append("root@Rain:~#")
 
     return "<pre>" + _esc("\n".join(lines)) + "</pre>"
 

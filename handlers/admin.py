@@ -149,8 +149,8 @@ def _build_admin_dashboard(db, admin_name: str, admin_id: int) -> str:
     total_revenue = db.query(func.coalesce(func.sum(Order.amount), 0)).scalar()
 
     return (
-        "<code>┌──(root㉿ZDeals)-[/control]</code>\n"
-        "<code>└─# sudo ZDeals-admin --dashboard</code>\n"
+        "<code>┌──(root㉿Rain)-[/control]</code>\n"
+        "<code>└─# sudo Rain-admin --dashboard</code>\n"
         "<code>[sudo] password:</code>\n"
         "<code>************</code>\n"
         "<code>[AUTH] Administrator Verified</code>\n"
@@ -174,7 +174,7 @@ def _build_admin_dashboard(db, admin_name: str, admin_id: int) -> str:
         "<code>Status      Operational</code>\n"
         "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<code>Awaiting administrator command...</code>\n"
-        "<code>root@ZDeals:~#</code>\n\n"
+        "<code>root@Rain:~#</code>\n\n"
         "👇 <b>Choose an action:</b>"
     )
 
@@ -249,7 +249,7 @@ def _build_user_dashboard(user) -> str:
     first_name = user.full_name.split()[0] if user.full_name else "user"
 
     return (
-        "🛍 ZDeals Store\n"
+        "🛍 Rain Store\n"
         "Premium Digital Marketplace\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👋 Welcome back, {safe(first_name)}\n\n"
@@ -334,7 +334,7 @@ async def admin_providers(callback: CallbackQuery, state: FSMContext):
 
     text = (
         "🏪 <b>PROVIDER MANAGEMENT</b>\n\n"
-        "<code>┌──(root㉿ZDeals)-[/providers]</code>\n"
+        "<code>┌──(root㉿Rain)-[/providers]</code>\n"
         "<code>└─# sudo stockctl provider --status</code>\n"
         "<code>[SYS] Provider Subsystem Ready</code>\n\n"
         "Manage API providers, credentials, and supplier connections.\n\n"
