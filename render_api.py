@@ -162,7 +162,7 @@ async def lifespan(app: FastAPI):
 # ============================================================
 
 app = FastAPI(
-    title="NomanBot Reseller API",
+    title="Rain Reseller API",
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
@@ -220,7 +220,7 @@ async def request_logger(request: Request, call_next):
 async def root():
     return {
         "status": "ok",
-        "service": "NomanBot Reseller API",
+        "service": "Rain Reseller API",
         "version": "1.0.0",
     }
 
@@ -229,7 +229,7 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "service": "NomanBot Reseller API",
+        "service": "Rain Reseller API",
     }
 
 
