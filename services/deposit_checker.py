@@ -480,6 +480,9 @@ _binance_client: Optional[Client] = None
 # it in memory and do not retry every deposit-check interval.
 _binance_access_restricted = False
 
+# Avoid repeating the same manual-review warning on every checker cycle.
+_binance_pending_skip_logged = False
+
 
 def _is_binance_location_restriction(error) -> bool:
     """Return True only for Binance's documented eligibility restriction."""
@@ -2904,6 +2907,8 @@ async def verify_deposit(
 
 async def check_pending_deposits():
 
+    global _binance_pending_skip_logged
+
     db = SessionLocal()
 
     try:
@@ -2961,7 +2966,11 @@ async def check_pending_deposits():
         len(upi_ids),
     )
 
-    if _binance_access_restricted and pay_ids:
+    if (
+        _binance_access_restricted
+        and pay_ids
+        and not _binance_pending_skip_logged
+    ):
 
         logger.warning(
             "Skipping %s Binance Pay deposit(s): Binance API access is "
@@ -2969,6 +2978,8 @@ async def check_pending_deposits():
             "manual review or use a compliant verification provider.",
             len(pay_ids),
         )
+
+        _binance_pending_skip_logged = True
 
     # ------------------------------------------------------------
     # CRYPTO
