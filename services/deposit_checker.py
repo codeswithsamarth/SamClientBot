@@ -475,6 +475,40 @@ _check_attempts: dict[int, int] = {}
 
 _binance_client: Optional[Client] = None
 
+# Binance may reject all API requests from the server's jurisdiction.  This is
+# an account/eligibility restriction, not a temporary network failure, so keep
+# it in memory and do not retry every deposit-check interval.
+_binance_access_restricted = False
+
+
+def _is_binance_location_restriction(error) -> bool:
+    """Return True only for Binance's documented eligibility restriction."""
+    message = str(error or "").lower()
+
+    return (
+        "restricted location" in message
+        or "eligibility" in message
+        or "service unavailable from a restricted" in message
+    )
+
+
+def _mark_binance_access_restricted(error, context: str) -> None:
+    """Open the process-local circuit breaker and log this terminal error once."""
+    global _binance_access_restricted
+
+    if _binance_access_restricted:
+        return
+
+    _binance_access_restricted = True
+
+    logger.error(
+        "Binance API disabled for this process after %s: %s. "
+        "The server location or account is not eligible for Binance API use; "
+        "Binance Pay deposits will remain pending for manual review.",
+        context,
+        error,
+    )
+
 
 # ================================================================
 # VALIDATORS
@@ -511,6 +545,9 @@ def valid_utr(utr: str) -> bool:
 def _get_binance_client() -> Optional[Client]:
     global _binance_client
 
+    if _binance_access_restricted:
+        return None
+
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         logger.warning(
             "Binance API credentials not configured"
@@ -536,8 +573,21 @@ def _get_binance_client() -> Optional[Client]:
                 - int(time_module.time() * 1000)
             )
 
-        except Exception:
-            pass
+        except Exception as exc:
+
+            if _is_binance_location_restriction(exc):
+
+                _mark_binance_access_restricted(
+                    exc,
+                    "server-time initialization",
+                )
+
+                return None
+
+            logger.warning(
+                "Binance server-time synchronization failed: %s",
+                exc,
+            )
 
         _binance_client = client
 
@@ -546,10 +596,20 @@ def _get_binance_client() -> Optional[Client]:
         return _binance_client
 
     except Exception as exc:
-        logger.error(
-            "Binance initialization failed: %s",
-            exc,
-        )
+
+        if _is_binance_location_restriction(exc):
+
+            _mark_binance_access_restricted(
+                exc,
+                "client initialization",
+            )
+
+        else:
+
+            logger.error(
+                "Binance initialization failed: %s",
+                exc,
+            )
 
         _binance_client = None
 
@@ -1073,6 +1133,15 @@ def _fetch_binance_deposits_sync(
 
         except BinanceAPIException as exc:
 
+            if _is_binance_location_restriction(exc):
+
+                _mark_binance_access_restricted(
+                    exc,
+                    "deposit-history request",
+                )
+
+                break
+
             logger.warning(
                 "Binance API error %s/%s: %s",
                 coin,
@@ -1081,6 +1150,15 @@ def _fetch_binance_deposits_sync(
             )
 
         except Exception as exc:
+
+            if _is_binance_location_restriction(exc):
+
+                _mark_binance_access_restricted(
+                    exc,
+                    "deposit-history request",
+                )
+
+                break
 
             logger.warning(
                 "Binance request error %s/%s: %s",
@@ -1861,7 +1939,14 @@ def _query_pay_trade_history_sync(
             "serverTime"
         ]
 
-    except Exception:
+    except Exception as exc:
+
+        if _is_binance_location_restriction(exc):
+
+            _mark_binance_access_restricted(
+                exc,
+                "Binance Pay server-time request",
+            )
 
         return []
 
@@ -1901,6 +1986,19 @@ def _query_pay_trade_history_sync(
         )
 
         if response.status_code != 200:
+
+            if _is_binance_location_restriction(response.text):
+
+                _mark_binance_access_restricted(
+                    response.text,
+                    "Binance Pay transaction-history request",
+                )
+
+            logger.warning(
+                "Binance Pay transaction-history request failed: HTTP %s",
+                response.status_code,
+            )
+
             return []
 
         payload = response.json()
@@ -2863,6 +2961,15 @@ async def check_pending_deposits():
         len(upi_ids),
     )
 
+    if _binance_access_restricted and pay_ids:
+
+        logger.warning(
+            "Skipping %s Binance Pay deposit(s): Binance API access is "
+            "restricted for this server. Keep these deposits pending for "
+            "manual review or use a compliant verification provider.",
+            len(pay_ids),
+        )
+
     # ------------------------------------------------------------
     # CRYPTO
     # ------------------------------------------------------------
@@ -2886,7 +2993,7 @@ async def check_pending_deposits():
     # BINANCE PAY
     # ------------------------------------------------------------
 
-    for deposit_id in pay_ids:
+    for deposit_id in ([] if _binance_access_restricted else pay_ids):
 
         try:
 
